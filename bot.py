@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 快活クラブ 王子店『ダーツ』空席ウォッチ（Telegram版）
-/start /menu /on /off /status /debug /ping
-日本語キーワード: 「スタート」「開始」「メニュー」 などでもメニューを表示
+最小表示：ボタン2行＋現在状態（🟢/🔴）
 """
 
 from __future__ import annotations
@@ -70,7 +69,7 @@ def status_line(chat_id: int) -> str:
 def menu_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     """1段目=トグル、2段目=今すぐ取得（見切れ防止で2行）"""
     on = is_subscribed(chat_id)
-    label_toggle = "⛔ 通知OFF" if on else "✅ 通知ON"  # “次のアクション”を表示
+    label_toggle = "⛔ 通知OFF" if on else "✅ 通知ON"  # 次のアクション
     btn_toggle = InlineKeyboardButton(label_toggle, callback_data="toggle_notify")
     btn_fetch  = InlineKeyboardButton("🔄 今すぐ取得", callback_data="fetch_now")
     return InlineKeyboardMarkup([[btn_toggle], [btn_fetch]])
@@ -127,12 +126,8 @@ async def fetch_status(debug: bool = False, timeout_sec: int = 60) -> Tuple[Opti
     except Exception as e:
         return None, f"error: {e}\n{traceback.format_exc(limit=2)}"
 
-# ========= コマンド =========
-INTRO = (
-    "王子店『ダーツ』空席ウォッチです。\n"
-    "/on で通知ON、/off で通知OFF、/status で現在の状況、/debug は解析用、/ping は疎通チェックです。\n"
-    "下のボタンで通知ON/OFFの切替や、今すぐ取得ができます。"
-)
+# ========= 表示テキスト =========
+INTRO = "快活クラブ『ダーツ』空席ウォッチ。下のボタンで通知ON/OFFの切替や、今すぐ取得ができます。"
 
 async def _send_menu_text(chat_id: int, c: ContextTypes.DEFAULT_TYPE, replying_to: Update | None = None):
     text = f"{INTRO}\n{status_line(chat_id)}"
@@ -141,6 +136,7 @@ async def _send_menu_text(chat_id: int, c: ContextTypes.DEFAULT_TYPE, replying_t
     else:
         await c.bot.send_message(chat_id, text, reply_markup=menu_keyboard(chat_id))
 
+# ========= コマンド =========
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     await _send_menu_text(u.effective_chat.id, c, replying_to=u)
 
@@ -177,16 +173,14 @@ async def cmd_debug(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         msg += f"\n--- debug ---\n{snippet}"
     await u.message.reply_text(msg)
 
-# ========= 日本語テキストでもメニューを出す =========
+# ========= 日本語キーワードでもメニューを出す =========
 _JP_MENU_WORDS = ("スタート", "開始", "メニュー", "めにゅー", "menu", "start", "help")
 
 async def on_text_keywords(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     if not u.message or not (txt := (u.message.text or "").strip()):
         return
-    # privateチャットのみを対象（グループでの誤反応を防ぐ）
     if u.effective_chat.type != "private":
         return
-    # キーワードが含まれればメニュー表示
     if any(w.lower() in txt.lower() for w in _JP_MENU_WORDS):
         await _send_menu_text(u.effective_chat.id, c, replying_to=u)
 
@@ -205,7 +199,6 @@ async def on_toggle_button(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         save_subs(SUBSCRIBERS)
         note = "通知を ON にしました。"
 
-    # メッセージ本文にも現在状態を出す
     try:
         await q.edit_message_text(f"{INTRO}\n{status_line(chat_id)}",
                                   reply_markup=menu_keyboard(chat_id))
@@ -260,9 +253,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("debug",  cmd_debug))
 
-    # 日本語キーワードでメニュー表示
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_keywords))
-
     app.add_handler(CallbackQueryHandler(on_toggle_button, pattern="^toggle_notify$"))
     app.add_handler(CallbackQueryHandler(on_fetch_now,   pattern="^fetch_now$"))
 
