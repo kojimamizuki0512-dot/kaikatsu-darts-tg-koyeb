@@ -1,156 +1,122 @@
-import asyncio
-import os
-import re
-from datetime import datetime, timezone, timedelta
-
-import httpx
-from bs4 import BeautifulSoup
+import os, json, asyncio, re, datetime as dt
+from pathlib import Path
+from typing import Optional
 from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, ContextTypes
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
+from playwright.async_api import async_playwright
 
-# ====== 設定 ======
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-SHOP_URL = os.environ.get(
-    "SHOP_URL",
-    "https://www.kaikatsu.jp/shop/detail/vacancy.html?store_code=20328"
-).strip()
-CHECK_INTERVAL_SEC = int(os.environ.get("CHECK_INTERVAL_SEC", "120"))
+SHOP_URL = os.getenv("SHOP_URL", "https://www.kaikatsu.jp/shop/detail/vacancy.html?store_code=20328")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-JST = timezone(timedelta(hours=9))
+STATE_PATH = Path("state.json")
+SUBS_PATH = Path("subs.json")
+CHECK_INTERVAL_SEC = 120  # 2分ごと
 
-# /on したチャットの集合（Koyeb は再起動で消える想定。必要ならDB等へ）
-subs: set[int] = set()
-last_status: str | None = None
-
-
-def parse_status_from_html(html: str) -> str | None:
-    """
-    vacancy.html の HTML から「ダーツ」の現在の空席数を推定して文字列で返す。
-    例: "残1席" / "満席" / "空席多数" 等。取れなければ None。
-    """
-    soup = BeautifulSoup(html, "lxml")
-
-    # テーブルの th/td から「ダーツ」の行を探す
-    # サイト側の表記ゆれ（全角スペースなど）を吸収
-    for th in soup.find_all("th"):
-        label = th.get_text(strip=True)
-        if "ダーツ" in label:
-            td = th.find_next("td")
-            if not td:
-                continue
-            text = td.get_text(strip=True)
-
-            # “残◯席”, “満席”, “空席” などを素直に返却
-            m = re.search(r"(残\d+席|満席|空席|×|○|△)", text)
-            return m.group(1) if m else text
-
-    # fallback: 画面上の「現在のダーツ: 残1席」のような文言を拾う
-    full = soup.get_text(" ", strip=True)
-    m = re.search(r"現在のダーツ[:：]\s*([^\s　]+)", full)
-    if m:
-        return m.group(1)
-
-    return None
-
-
-async def fetch_status(client: httpx.AsyncClient) -> str | None:
-    """HTTP/2は使わずに取得（h2依存を避ける）。"""
-    r = await client.get(SHOP_URL, timeout=20)
-    r.raise_for_status()
-    return parse_status_from_html(r.text)
-
-
-async def notify_all(app, text: str):
-    for chat_id in list(subs):
+def load_json(p: Path, default):
+    if p.exists():
         try:
-            await app.bot.send_message(chat_id=chat_id, text=text)
+            return json.loads(p.read_text(encoding="utf-8"))
         except Exception:
-            # 送れなかったら購読から外すなどの処理を入れても良い
-            pass
+            return default
+    return default
 
+def save_json(p: Path, data):
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-async def poll_job(context: ContextTypes.DEFAULT_TYPE):
-    global last_status
-    async with httpx.AsyncClient(http2=False, headers={
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/129.0 Safari/537.36"
-    }) as client:
-        try:
-            status = await fetch_status(client)
-        except Exception as e:
-            # サイレント失敗（ログだけ）
-            print("poll error:", repr(e))
-            return
+state = load_json(STATE_PATH, {"last_status": None, "last_changed_at": None})
+subs = set(load_json(SUBS_PATH, []))
 
-    now = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
-    if status is None:
-        print(f"[{now}] status=None")
-        return
+async def fetch_status() -> Optional[str]:
+    """
+    快活の空席ページを Playwright(Chromium) で開き、
+    ページ内テキストから「ダーツ」行の数字を抽出して返す。
+    例: "残1席" / "満席" / None(取得失敗)
+    """
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True)
+            context = await browser.new_context()
+            page = await context.new_page()
+            await page.goto(SHOP_URL, wait_until="domcontentloaded", timeout=30000)
 
-    if status != last_status:
-        last_status = status
-        msg = f"【更新】ダーツの空席状況: {status}（{now}）\n{SHOP_URL}"
-        await notify_all(context.application, msg)
-        print("notified:", msg)
+            # vacancy_area.js を辿る方式は店舗によって分岐するため、まずは画面全体テキストから拾う
+            text = await page.inner_text("body")
+            await browser.close()
 
+        # 一番素直に「ダーツ」「残」「満」あたりで拾う
+        # 例: 「ダーツ 残1席」, 「ダーツ 満席」
+        m = re.search(r"ダーツ[^\\n]*?(残\s*\d+\s*席|満席)", text)
+        if not m:
+            return None
+        word = m.group(1)
+        word = re.sub(r"\s+", "", word)  # 空白除去 「残1席」「満席」
+        return word
+    except Exception:
+        return None
 
-# ====== Telegram コマンド ======
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "王子店『ダーツ』空席ウォッチです。\n"
-        "/on で通知 ON、/off で通知 OFF、/status で現在の状況を取得します。"
+        "/on で通知ON、/off で通知OFF、/status で現在の状況。\n"
+        "/debug は解析用です。"
     )
 
-async def cmd_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    subs.add(update.effective_chat.id)
+async def cmd_on(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    subs.add(chat_id)
+    save_json(SUBS_PATH, list(subs))
     await update.message.reply_text("通知を ON にしました。")
 
-async def cmd_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    subs.discard(update.effective_chat.id)
+async def cmd_off(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    subs.discard(chat_id)
+    save_json(SUBS_PATH, list(subs))
     await update.message.reply_text("通知を OFF にしました。")
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    async with httpx.AsyncClient(http2=False, headers={
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/129.0 Safari/537.36"
-    }) as client:
-        try:
-            status = await fetch_status(client)
-        except Exception:
-            await update.message.reply_text("取得に失敗しました。後でもう一度。")
-            return
-
-    now = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
-    if status is None:
-        await update.message.reply_text("取得に失敗しました。後でもう一度。")
+async def cmd_status(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    s = await fetch_status()
+    if s:
+        now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        await update.message.reply_text(f"現在のダーツ: {s}（{now}）")
     else:
-        await update.message.reply_text(f"現在のダーツ: {status}（{now}）")
+        await update.message.reply_text("取得に失敗しました。後でもう一度。")
 
+async def cmd_debug(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    s = await fetch_status()
+    await update.message.reply_text(
+        f"status={s}\nURL={SHOP_URL}"
+    )
 
-def ensure_env():
-    if not BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN が未設定です。KoyebのSecretsに設定して再デプロイしてください。")
+async def poll_job(_: ContextTypes.DEFAULT_TYPE):
+    s = await fetch_status()
+    if s is None:
+        return
+    last = state.get("last_status")
+    if last != s:
+        state["last_status"] = s
+        state["last_changed_at"] = dt.datetime.now().isoformat(timespec="seconds")
+        save_json(STATE_PATH, state)
+        # 変化したら全購読者へ通知
+        text = f"【ダーツ 空席状況が変化】\n現在: {s}"
+        for cid in list(subs):
+            try:
+                await app.bot.send_message(chat_id=cid, text=text)
+            except Exception:
+                pass
 
+def build_app():
+    application = Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("on", cmd_on))
+    application.add_handler(CommandHandler("off", cmd_off))
+    application.add_handler(CommandHandler("status", cmd_status))
+    application.add_handler(CommandHandler("debug", cmd_debug))
+    # JobQueue
+    application.job_queue.run_repeating(poll_job, interval=CHECK_INTERVAL_SEC, first=5)
+    return application
 
-async def main_async():
-    ensure_env()
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    # commands
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("on", cmd_on))
-    app.add_handler(CommandHandler("off", cmd_off))
-    app.add_handler(CommandHandler("status", cmd_status))
-
-    # poll
-    app.job_queue.run_repeating(poll_job, interval=CHECK_INTERVAL_SEC, first=5)
-
-    print("Bot started")
-    await app.run_polling(close_loop=False, drop_pending_updates=True)
-
+app = build_app()
 
 if __name__ == "__main__":
-    asyncio.run(main_async())
+    print("Bot starting…")
+    app.run_polling(drop_pending_updates=True)

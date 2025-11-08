@@ -1,21 +1,19 @@
 FROM python:3.11-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
-# 依存に必要な最低限のツール
+# 基本ツール
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates fonts-ipafont-gothic fonts-ipafont-mincho \
-    && rm -rf /var/lib/apt/lists/*
+    ca-certificates curl wget gnupg && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+COPY requirements.txt /app/requirements.txt
 
-# 先に requirements を入れてキャッシュを効かせる
-COPY KaikatsuDartsTG-Koyeb/requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+# 依存インストール（job-queue付きPTBとPlaywright）
+RUN pip install --no-cache-dir -r /app/requirements.txt && \
+    python -m playwright install --with-deps chromium
 
-# アプリ本体
-COPY KaikatsuDartsTG-Koyeb/bot.py /app/bot.py
+# ソース配置
+COPY bot.py /app/bot.py
 
-# 起動
-CMD ["python", "/app/bot.py"]
+ENV PYTHONUNBUFFERED=1
+CMD ["python","-u","/app/bot.py"]
