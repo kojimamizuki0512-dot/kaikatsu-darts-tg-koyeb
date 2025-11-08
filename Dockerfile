@@ -1,19 +1,18 @@
-FROM python:3.11-slim
+# Playwright + Python の公式イメージ（ブラウザ/依存込み）
+FROM mcr.microsoft.com/playwright/python:v1.48.0-jammy
 
-# 基本ツール
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl wget gnupg && \
-    rm -rf /var/lib/apt/lists/*
-
+# 作業ディレクトリ
 WORKDIR /app
+
+# 依存（PTBのみ。Playwrightはイメージに入っている）
 COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# 依存インストール（job-queue付きPTBとPlaywright）
-RUN pip install --no-cache-dir -r /app/requirements.txt && \
-    python -m playwright install --with-deps chromium
-
-# ソース配置
+# ソース
 COPY bot.py /app/bot.py
 
+# ログを即時出力
 ENV PYTHONUNBUFFERED=1
-CMD ["python","-u","/app/bot.py"]
+
+# 実行
+CMD ["python", "-u", "/app/bot.py"]
