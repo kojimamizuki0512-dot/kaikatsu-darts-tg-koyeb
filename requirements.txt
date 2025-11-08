@@ -1,2 +1,2 @@
 python-telegram-bot[job-queue]==20.7
-playwright==1.48.0
+# playwright はベースイメージに同梱（v1.47.0）
