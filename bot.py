@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 快活クラブ 王子店『ダーツ』空席ウォッチ（Telegram版）
-/start  /on  /off  /status  /debug
+/start /on /off /status /debug /ping
 """
 
 from __future__ import annotations
@@ -19,10 +19,9 @@ from telegram.ext import ApplicationBuilder, Application, CommandHandler, Contex
 from playwright.async_api import async_playwright
 
 # ========= 設定 =========
-# ※ 環境変数があれば優先（KoyebのEnvで設定できる）
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "PUT_YOUR_FALLBACK_TOKEN_HERE")
 URL = os.getenv("SHOP_URL", "https://www.kaikatsu.jp/shop/detail/vacancy.html?store_code=20328")
-CHECK_INTERVAL_SEC = int(os.getenv("CHECK_SEC", "180"))  # ← 180秒に延長
+CHECK_INTERVAL_SEC = int(os.getenv("CHECK_SEC", "180"))
 SUBS_FILE = "subs.json"
 
 # ========= ロギング =========
@@ -59,7 +58,6 @@ def now_jp() -> str:
 
 # ========= 取得＆解析 =========
 async def fetch_status(debug: bool = False) -> Tuple[Optional[str], Optional[str]]:
-    """成功: (status文字列, デバッグ用スニペット) / 失敗: (None, ヒント)"""
     snippet = None
     try:
         async with async_playwright() as p:
@@ -85,7 +83,7 @@ async def fetch_status(debug: bool = False) -> Tuple[Optional[str], Optional[str
                 except Exception:
                     pass
 
-            await page.wait_for_timeout(1200)  # 軽く待つ
+            await page.wait_for_timeout(1200)
             body_text = await page.evaluate("document.body.innerText")
             await browser.close()
 
@@ -116,7 +114,12 @@ async def fetch_status(debug: bool = False) -> Tuple[Optional[str], Optional[str
         return None, err
 
 # ========= Telegram コマンド =========
+async def cmd_ping(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    log.info("cmd_ping from chat_id=%s", u.effective_chat.id if u.effective_chat else None)
+    await u.message.reply_text(f"pong ({now_jp()})")
+
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    log.info("cmd_start chat_id=%s", u.effective_chat.id)
     await u.message.reply_text(
         "王子店『ダーツ』空席ウォッチです。\n"
         "/on で通知ON、/off で通知OFF、/status で現在の状況、/debug は解析用です。"
@@ -125,20 +128,29 @@ async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_on(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     SUBSCRIBERS.add(u.effective_chat.id)
     save_subs(SUBSCRIBERS)
+    log.info("cmd_on: chat_id %s subscribed", u.effective_chat.id)
     await u.message.reply_text("通知を ON にしました。")
 
 async def cmd_off(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     SUBSCRIBERS.discard(u.effective_chat.id)
     save_subs(SUBSCRIBERS)
+    log.info("cmd_off: chat_id %s unsubscribed", u.effective_chat.id)
     await u.message.reply_text("通知を OFF にしました。")
 
 async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
-    status, _ = await fetch_status(False)
-    await u.message.reply_text(
-        f"現在のダーツ: {status}（{now_jp()}）" if status else "取得に失敗しました。"
-    )
+    log.info("cmd_status from chat_id=%s", u.effective_chat.id)
+    # まず即時に “取得中…” を返す
+    msg = await u.message.reply_text("取得中…（最大 ~40秒）")
+    try:
+        # 長引く場合に備えタイムアウトを付ける
+        status, _ = await asyncio.wait_for(fetch_status(False), timeout=45)
+        text = f"現在のダーツ: {status}（{now_jp()}）" if status else "取得に失敗しました。"
+        await msg.edit_text(text)
+    except asyncio.TimeoutError:
+        await msg.edit_text("タイムアウトしました。/status をもう一度試してください。")
 
 async def cmd_debug(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    log.info("cmd_debug from chat_id=%s", u.effective_chat.id)
     status, snippet = await fetch_status(True)
     msg = f"status={status}\nURL={URL}"
     if snippet:
@@ -146,15 +158,16 @@ async def cmd_debug(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     await u.message.reply_text(msg)
 
 # ========= 監視ジョブ =========
-_lock = asyncio.Lock()  # オーバーラップ防止
+_lock = asyncio.Lock()
 
 async def poll_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if _lock.locked():
-        # すでに実行中なら静かにスキップ（スケジューラのskip警告を抑制）
         return
     async with _lock:
         global LAST_STATUS
+        log.info("poll_job: start")
         status, _ = await fetch_status(False)
+        log.info("poll_job: fetched status=%s", status)
         if not status:
             return
         if status != LAST_STATUS:
@@ -168,12 +181,12 @@ async def poll_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 def build_app() -> Application:
     app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("on", cmd_on))
     app.add_handler(CommandHandler("off", cmd_off))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("debug", cmd_debug))
-    # ← ここを調整：間隔180s、max_instances=2、coalesceで取りこぼし抑制
     app.job_queue.run_repeating(
         poll_job,
         interval=CHECK_INTERVAL_SEC,
