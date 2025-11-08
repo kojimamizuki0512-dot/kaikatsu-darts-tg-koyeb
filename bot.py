@@ -2,40 +2,40 @@
 """
 快活クラブ 王子店『ダーツ』空席ウォッチ（Telegram版）
 /start /on /off /status /debug /ping
+
+改修点:
+- asyncio.Lockでスクレイプの同時実行を防止（/status と 定期ジョブの競合を解消）
+- 60秒キャッシュで即応答（/status は直近結果を使い、force時は再取得）
+- Playwrightに総合45秒のタイムアウト
+- concurrent_updates=False でPTB側の並列処理を停止
 """
 
 from __future__ import annotations
-import os
-import json
-import logging
-import re
-import asyncio
-import traceback
-from datetime import datetime
+import os, json, re, logging, traceback, time, asyncio
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, Application, CommandHandler, ContextTypes
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
-# ========= 設定 =========
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "PUT_YOUR_FALLBACK_TOKEN_HERE")
-URL = os.getenv("SHOP_URL", "https://www.kaikatsu.jp/shop/detail/vacancy.html?store_code=20328")
-CHECK_INTERVAL_SEC = int(os.getenv("CHECK_SEC", "180"))
-SUBS_FILE = "subs.json"
+# ========= 環境変数 =========
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+URL = os.environ.get("SHOP_URL", "https://www.kaikatsu.jp/shop/detail/vacancy.html?store_code=20328")
+CHECK_INTERVAL_SEC = int(os.environ.get("CHECK_INTERVAL", "120"))
 
 # ========= ロギング =========
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("kaikatsu-bot")
 
-# ========= 通知先の保存 =========
+# ========= 永続（購読者） =========
+SUBS_FILE = "subs.json"
 def load_subs() -> set[int]:
     try:
         with open(SUBS_FILE, "r", encoding="utf-8") as f:
             return set(json.load(f))
     except Exception:
         return set()
-
 def save_subs(s: set[int]) -> None:
     try:
         with open(SUBS_FILE, "w", encoding="utf-8") as f:
@@ -48,151 +48,146 @@ LAST_STATUS: Optional[str] = None
 
 # ========= ユーティリティ =========
 _Z2H = str.maketrans("０１２３４５６７８９", "0123456789")
-
 def norm_spaces(s: str) -> str:
-    s = s.translate(_Z2H)
-    return re.sub(r"[\u3000\t ]+", " ", s)
-
+    return re.sub(r"[\u3000\t ]+", " ", s.translate(_Z2H))
 def now_jp() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    JST = timezone(timedelta(hours=9))
+    return datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
 
-# ========= 取得＆解析 =========
-async def fetch_status(debug: bool = False) -> Tuple[Optional[str], Optional[str]]:
-    snippet = None
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage"],
-            )
-            ctx = await browser.new_context(
-                locale="ja-JP",
-                user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/120.0 Safari/537.36"),
-                java_script_enabled=True,
-            )
-            page = await ctx.new_page()
-            await page.goto(URL, wait_until="domcontentloaded", timeout=45000)
+# ========= 競合対策：ロック & キャッシュ =========
+SCRAPE_LOCK = asyncio.Lock()
+CACHE_TTL = 60  # 秒
+_cache_ts: float = 0.0
+_cache_status: Optional[str] = None
+_cache_snip: Optional[str] = None
 
-            # Cookieバナー等があれば閉じる（無ければ無視）
-            for sel in ["#onetrust-accept-btn-handler", ".btn-accept", "button.accept"]:
-                try:
-                    await page.locator(sel).click(timeout=1000)
-                    break
-                except Exception:
-                    pass
+async def _scrape_once() -> Tuple[Optional[str], Optional[str]]:
+    """Playwrightで1回だけ取得。45秒でタイムアウト。"""
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+        ctx = await browser.new_context(
+            locale="ja-JP",
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"),
+            java_script_enabled=True,
+        )
+        page = await ctx.new_page()
+        await page.goto(URL, wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(1200)
+        body_text = await page.evaluate("document.body.innerText")
+        await browser.close()
 
-            await page.wait_for_timeout(1200)
-            body_text = await page.evaluate("document.body.innerText")
-            await browser.close()
+    t = norm_spaces(body_text)
+    pat = re.compile(r"(満席|残\s*\d+\s*席(?:以上)?)")
+    lines = t.splitlines()
+    for i, ln in enumerate(lines):
+        if "ダーツ" in ln:
+            m = pat.search(ln)
+            if m:
+                return m.group(1), norm_spaces(ln)[:200]
+            ctx = " ".join(lines[i:i+3])
+            m = pat.search(ctx)
+            if m:
+                return m.group(1), norm_spaces(ctx)[:200]
+    m = re.search(r"ダーツ.*?(満席|残\s*\d+\s*席(?:以上)?)", t, re.S)
+    if m:
+        return m.group(1), norm_spaces(t)[:300]
+    return None, norm_spaces(t)[:500]  # 未検出時はスニペット返す
 
-        t = norm_spaces(body_text)
+async def fetch_status(debug: bool = False, force: bool = False) -> Tuple[Optional[str], Optional[str]]:
+    """
+    キャッシュを考慮して状態を返す。force=Trueで必ず再取得。
+    取得はロックで直列化。例外は (None, エラー文) に畳み込む。
+    """
+    global _cache_ts, _cache_status, _cache_snip
+    now = time.monotonic()
 
-        pat = re.compile(r"(満席|残\s*\d+\s*席(?:以上)?)")
-        lines = t.splitlines()
-        for i, ln in enumerate(lines):
-            if "ダーツ" in ln:
-                m = pat.search(ln)
-                if m:
-                    return m.group(1), (norm_spaces(ln)[:200] if debug else None)
-                ctx2 = " ".join(lines[i:i+3])
-                m = pat.search(ctx2)
-                if m:
-                    return m.group(1), (norm_spaces(ctx2)[:200] if debug else None)
+    # キャッシュ
+    if not force and _cache_status is not None and now - _cache_ts < CACHE_TTL:
+        return _cache_status, (_cache_snip if debug else None)
 
-        m = re.search(r"ダーツ.*?(満席|残\s*\d+\s*席(?:以上)?)", t, re.S)
-        if m:
-            return m.group(1), (norm_spaces(t)[:300] if debug else None)
-
-        if debug:
-            snippet = norm_spaces(t)[:700]
-        return None, snippet
-
-    except Exception as e:
-        err = f"error: {e}\n{traceback.format_exc(limit=2)}"
-        return None, err
+    async with SCRAPE_LOCK:
+        # ロック待ちの間に他が更新してる可能性があるので再チェック
+        now2 = time.monotonic()
+        if not force and _cache_status is not None and now2 - _cache_ts < CACHE_TTL:
+            return _cache_status, (_cache_snip if debug else None)
+        try:
+            status, snip = await asyncio.wait_for(_scrape_once(), timeout=45)
+            _cache_ts = time.monotonic()
+            _cache_status = status
+            _cache_snip = snip
+            return status, (snip if debug else None)
+        except (PWTimeout, Exception) as e:
+            err = f"error: {e}\n{traceback.format_exc(limit=2)}"
+            log.warning("fetch_status failed: %s", err)
+            return None, err
 
 # ========= Telegram コマンド =========
-async def cmd_ping(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
-    log.info("cmd_ping from chat_id=%s", u.effective_chat.id if u.effective_chat else None)
-    await u.message.reply_text(f"pong ({now_jp()})")
-
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
-    log.info("cmd_start chat_id=%s", u.effective_chat.id)
     await u.message.reply_text(
         "王子店『ダーツ』空席ウォッチです。\n"
-        "/on で通知ON、/off で通知OFF、/status で現在の状況、/debug は解析用です。"
+        "/on で通知ON、/off で通知OFF、/status で現在の状況、/debug は解析用、/ping は疎通チェックです。"
     )
+
+async def cmd_ping(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    await u.message.reply_text(f"pong ({now_jp()})")
 
 async def cmd_on(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     SUBSCRIBERS.add(u.effective_chat.id)
     save_subs(SUBSCRIBERS)
-    log.info("cmd_on: chat_id %s subscribed", u.effective_chat.id)
     await u.message.reply_text("通知を ON にしました。")
 
 async def cmd_off(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     SUBSCRIBERS.discard(u.effective_chat.id)
     save_subs(SUBSCRIBERS)
-    log.info("cmd_off: chat_id %s unsubscribed", u.effective_chat.id)
     await u.message.reply_text("通知を OFF にしました。")
 
 async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
-    log.info("cmd_status from chat_id=%s", u.effective_chat.id)
-    # まず即時に “取得中…” を返す
-    msg = await u.message.reply_text("取得中…（最大 ~40秒）")
-    try:
-        # 長引く場合に備えタイムアウトを付ける
-        status, _ = await asyncio.wait_for(fetch_status(False), timeout=45)
-        text = f"現在のダーツ: {status}（{now_jp()}）" if status else "取得に失敗しました。"
-        await msg.edit_text(text)
-    except asyncio.TimeoutError:
-        await msg.edit_text("タイムアウトしました。/status をもう一度試してください。")
+    await u.message.reply_text("取得中…（最大 ~45秒）")
+    status, _ = await fetch_status(debug=False, force=True)  # 必ず最新を取りに行く
+    await u.message.reply_text(
+        f"現在のダーツ: {status}（{now_jp()}）" if status else "取得に失敗しました。しばらくして再実行してください。"
+    )
 
 async def cmd_debug(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
-    log.info("cmd_debug from chat_id=%s", u.effective_chat.id)
-    status, snippet = await fetch_status(True)
+    status, snip = await fetch_status(debug=True, force=True)
     msg = f"status={status}\nURL={URL}"
-    if snippet:
-        msg += f"\n--- debug ---\n{snippet}"
+    if snip:
+        msg += f"\n--- debug ---\n{snip}"
     await u.message.reply_text(msg)
 
 # ========= 監視ジョブ =========
-_lock = asyncio.Lock()
-
 async def poll_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if _lock.locked():
+    global LAST_STATUS
+    status, _ = await fetch_status(debug=False, force=False)  # キャッシュ可
+    if not status:
         return
-    async with _lock:
-        global LAST_STATUS
-        log.info("poll_job: start")
-        status, _ = await fetch_status(False)
-        log.info("poll_job: fetched status=%s", status)
-        if not status:
-            return
-        if status != LAST_STATUS:
-            LAST_STATUS = status
-            text = f"【更新】王子店ダーツ: {status}（{now_jp()}）\n{URL}"
-            for chat_id in list(SUBSCRIBERS):
-                try:
-                    await ctx.bot.send_message(chat_id, text)
-                except Exception as e:
-                    log.warning("send failed %s: %s", chat_id, e)
+    if status != LAST_STATUS:
+        LAST_STATUS = status
+        text = f"【更新】王子店ダーツ: {status}（{now_jp()}）\n{URL}"
+        for chat_id in list(SUBSCRIBERS):
+            try:
+                await ctx.bot.send_message(chat_id, text)
+            except Exception as e:
+                log.warning("send failed %s: %s", chat_id, e)
 
 def build_app() -> Application:
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("ping", cmd_ping))
+    app = ApplicationBuilder().token(TOKEN).concurrent_updates(False).build()
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("on", cmd_on))
     app.add_handler(CommandHandler("off", cmd_off))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("debug", cmd_debug))
+    # 重複起動を抑止（max_instances=1, coalesce=True）
     app.job_queue.run_repeating(
         poll_job,
         interval=CHECK_INTERVAL_SEC,
-        first=5,
-        job_kwargs={"max_instances": 2, "coalesce": True, "misfire_grace_time": 60},
+        first=10,
         name="poll_job",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=30,
     )
     return app
 
