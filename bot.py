@@ -3,11 +3,11 @@
 快活クラブ 王子店『ダーツ』空席ウォッチ（Telegram版）
 /start /on /off /status /debug /ping
 
-改修点:
-- asyncio.Lockでスクレイプを直列化
-- 60秒キャッシュ & 45秒タイムアウト
-- python-telegram-bot v20系: JobQueue.run_repeating へは job_kwargs=... を使用
-- concurrent_updates(False) でPTB側の並列処理を抑止
+安定化ポイント:
+- Playwright/Chromium をプロセス内で常駐させ再利用（毎回起動しない）
+- --no-sandbox, --disable-dev-shm-usage でコンテナ環境に最適化
+- 直列化ロック＋60秒キャッシュ＋リトライ＋長めのタイムアウト
+- PTB v20系: JobQueue.run_repeating へは job_kwargs で引数を渡す
 """
 
 from __future__ import annotations
@@ -54,28 +54,72 @@ def now_jp() -> str:
     JST = timezone(timedelta(hours=9))
     return datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
 
-# ========= 競合対策：ロック & キャッシュ =========
+# ========= Playwright 常駐（シングルトン） =========
 SCRAPE_LOCK = asyncio.Lock()
-CACHE_TTL = 60  # 秒
 _cache_ts: float = 0.0
 _cache_status: Optional[str] = None
 _cache_snip: Optional[str] = None
+CACHE_TTL = 60  # 秒
 
-async def _scrape_once() -> Tuple[Optional[str], Optional[str]]:
-    """Playwrightで1回だけ取得。45秒でタイムアウト。"""
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        ctx = await browser.new_context(
+_play = None       # Playwright
+_browser = None    # Browser
+_context = None    # BrowserContext
+
+async def get_context():
+    """Chromium を1度だけ起動して使い回す。落ちていたら作り直す。"""
+    global _play, _browser, _context
+    try:
+        if _context:
+            return _context
+        if _play is None:
+            _play = await async_playwright().start()
+        if _browser is None:
+            _browser = await _play.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--no-zygote",
+                ],
+            )
+        _context = await _browser.new_context(
             locale="ja-JP",
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"),
             java_script_enabled=True,
         )
-        page = await ctx.new_page()
-        await page.goto(URL, wait_until="domcontentloaded", timeout=30000)
+        return _context
+    except Exception as e:
+        log.warning("get_context failed: %s", e)
+        # クリアして次回再生成
+        _play = None
+        _browser = None
+        _context = None
+        raise
+
+async def _scrape_once() -> Tuple[Optional[str], Optional[str]]:
+    """Playwrightで1回取得（contextは常駐を使用）。"""
+    ctx = await get_context()
+    page = await ctx.new_page()
+    try:
+        page.set_default_navigation_timeout(60000)  # 60s
+        await page.goto(URL, wait_until="domcontentloaded", timeout=60000)
+        # ほんの少し描画を待つ
         await page.wait_for_timeout(1200)
+        # Cookieバナー等があれば閉じる（失敗しても無視）
+        for sel in ["#onetrust-accept-btn-handler", ".btn-accept", "button.accept"]:
+            try:
+                await page.locator(sel).click(timeout=800)
+                break
+            except Exception:
+                pass
         body_text = await page.evaluate("document.body.innerText")
-        await browser.close()
+    finally:
+        try:
+            await page.close()
+        except Exception:
+            pass
 
     t = norm_spaces(body_text)
     pat = re.compile(r"(満席|残\s*\d+\s*席(?:以上)?)")
@@ -85,37 +129,46 @@ async def _scrape_once() -> Tuple[Optional[str], Optional[str]]:
             m = pat.search(ln)
             if m:
                 return m.group(1), norm_spaces(ln)[:200]
-            ctx = " ".join(lines[i:i+3])
-            m = pat.search(ctx)
+            ctx2 = " ".join(lines[i:i+3])
+            m = pat.search(ctx2)
             if m:
-                return m.group(1), norm_spaces(ctx)[:200]
+                return m.group(1), norm_spaces(ctx2)[:200]
     m = re.search(r"ダーツ.*?(満席|残\s*\d+\s*席(?:以上)?)", t, re.S)
     if m:
         return m.group(1), norm_spaces(t)[:300]
     return None, norm_spaces(t)[:500]
 
 async def fetch_status(debug: bool = False, force: bool = False) -> Tuple[Optional[str], Optional[str]]:
-    """キャッシュを考慮。force=Trueなら必ず再取得。取得はLockで直列化。"""
+    """キャッシュとロック、リトライ付き取得。"""
     global _cache_ts, _cache_status, _cache_snip
     now = time.monotonic()
-
     if not force and _cache_status is not None and now - _cache_ts < CACHE_TTL:
         return _cache_status, (_cache_snip if debug else None)
 
     async with SCRAPE_LOCK:
+        # 二重取得抑止（待っている間に他スレッドが更新した場合）
         now2 = time.monotonic()
         if not force and _cache_status is not None and now2 - _cache_ts < CACHE_TTL:
             return _cache_status, (_cache_snip if debug else None)
-        try:
-            status, snip = await asyncio.wait_for(_scrape_once(), timeout=45)
-            _cache_ts = time.monotonic()
-            _cache_status = status
-            _cache_snip = snip
-            return status, (snip if debug else None)
-        except (PWTimeout, Exception) as e:
-            err = f"error: {e}\n{traceback.format_exc(limit=2)}"
-            log.warning("fetch_status failed: %s", err)
-            return None, err
+
+        last_err = None
+        for attempt in range(2):  # 軽めにリトライ1回
+            try:
+                status, snip = await asyncio.wait_for(_scrape_once(), timeout=75)  # 75s
+                _cache_ts = time.monotonic()
+                _cache_status = status
+                _cache_snip = snip
+                return status, (snip if debug else None)
+            except (PWTimeout, asyncio.TimeoutError) as e:
+                last_err = f"timeout: {e}"
+                log.warning("scrape timeout (attempt %s): %s", attempt + 1, e)
+            except Exception as e:
+                last_err = f"error: {e}\n{traceback.format_exc(limit=2)}"
+                log.warning("scrape error (attempt %s): %s", attempt + 1, e)
+                # コンテキスト壊れている可能性→再生成して次へ
+                global _play, _browser, _context
+                _play = _browser = _context = None
+        return None, last_err
 
 # ========= Telegram コマンド =========
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
@@ -138,10 +191,10 @@ async def cmd_off(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     await u.message.reply_text("通知を OFF にしました。")
 
 async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
-    await u.message.reply_text("取得中…（最大 ~45秒）")
+    await u.message.reply_text("取得中…（最大 ~60秒）")
     status, _ = await fetch_status(debug=False, force=True)
     await u.message.reply_text(
-        f"現在のダーツ: {status}（{now_jp()}）" if status else "取得に失敗しました。しばらくして再実行してください。"
+        f"現在のダーツ: {status}（{now_jp()}）" if status else "取得に失敗しました。少し待って再実行してください。"
     )
 
 async def cmd_debug(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
@@ -154,7 +207,7 @@ async def cmd_debug(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
 # ========= 監視ジョブ =========
 async def poll_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     global LAST_STATUS
-    status, _ = await fetch_status(debug=False, force=False)  # キャッシュ可
+    status, _ = await fetch_status(debug=False, force=False)
     if not status:
         return
     if status != LAST_STATUS:
@@ -174,7 +227,6 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("off", cmd_off))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("debug", cmd_debug))
-    # 重要: v20系は job_kwargs=... にまとめて渡す
     app.job_queue.run_repeating(
         poll_job,
         interval=CHECK_INTERVAL_SEC,
