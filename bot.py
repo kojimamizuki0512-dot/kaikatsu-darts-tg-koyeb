@@ -3,7 +3,7 @@
 快活クラブ 王子店『ダーツ』空席ウォッチ（Telegram版）
 /start /menu /on /off /status /debug /ping
 インラインボタン:
-  - ⛔ / ✅  … 押したら実行される“アクション”表示に変更
+  - ⛔ / ✅  … 押したら実行される“アクション”表示（現在状態ではなくアクション）
   - 🔄 今すぐ取得 … /status 相当（同じメッセージを編集）
 """
 
@@ -71,15 +71,18 @@ def is_subscribed(chat_id: int) -> bool:
 
 def menu_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     """
-    ボタンは“現在状態”ではなく“押したら実行されるアクション”を表示。
-      - 通知ON中  -> ⛔ 通知OFF（タップで停止）
-      - 通知OFF中 -> ✅ 通知ON（タップで開始）
+    2行レイアウト：
+      1段目 = 通知ON/OFFトグル（アクション表示）
+      2段目 = 今すぐ取得
+    ラベルは短くして見切れ防止。
     """
     on = is_subscribed(chat_id)
-    label_toggle = "⛔ 通知OFF（タップで停止）" if on else "✅ 通知ON（タップで開始）"
+    # 現在ONなら「OFFにする」ボタン、現在OFFなら「ONにする」ボタン
+    label_toggle = "⛔ 通知OFF" if on else "✅ 通知ON"
     btn_toggle = InlineKeyboardButton(label_toggle, callback_data="toggle_notify")
     btn_fetch  = InlineKeyboardButton("🔄 今すぐ取得", callback_data="fetch_now")
-    return InlineKeyboardMarkup([[btn_toggle, btn_fetch]])
+    # ここを 2 行に分割（各行は別のリスト）
+    return InlineKeyboardMarkup([[btn_toggle], [btn_fetch]])
 
 # ========= 取得＆解析 =========
 async def fetch_status(debug: bool = False, timeout_sec: int = 60) -> Tuple[Optional[str], Optional[str]]:
@@ -199,7 +202,6 @@ async def on_toggle_button(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         save_subs(SUBSCRIBERS)
         note = "通知を ON にしました。"
 
-    # ボタン更新（“アクション表示”へ切替）
     try:
         await q.edit_message_reply_markup(reply_markup=menu_keyboard(chat_id))
     except Exception:
