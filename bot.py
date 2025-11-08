@@ -1,157 +1,212 @@
-import os, re, json, asyncio, logging
+import os
+import re
+import json
+import asyncio
+import logging
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Set
 
-import httpx
 from telegram import Update
 from telegram.ext import (
-    Application, ApplicationBuilder, CommandHandler, ContextTypes,
+    Application, CommandHandler, ContextTypes,
 )
+
+from playwright.async_api import async_playwright
 
 # ====== 設定 ======
-SHOP_URL = os.getenv("SHOP_URL", "https://www.kaikatsu.jp/shop/detail/vacancy.html?store_code=20328")
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "120"))
-
-# Jobの暴走防止（長すぎる処理は打ち切る）
-HARD_TIMEOUT_SEC = 30
-
-# ====== ロギング ======
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+SHOP_URL = os.environ.get(
+    "SHOP_URL",
+    "https://www.kaikatsu.jp/shop/detail/vacancy.html?store_code=20328",
 )
-log = logging.getLogger("kaikatsu-bot")
+BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+CHECK_INTERVAL_SEC = int(os.environ.get("CHECK_INTERVAL_SEC", "120"))
 
-# ====== 状態 ======
-subscribers: Set[int] = set()
-last_status: Optional[str] = None
+JST = timezone(timedelta(hours=9))
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.INFO,
+)
 
-# ====== 取得・解析 ======
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/129.0.0.0 Safari/537.36",
-    "Referer": "https://www.kaikatsu.jp/",
-}
+# メモリ保持（Koyeb再起動でリセットされます）
+SUBSCRIBERS_PATH = "subs.json"
+STATE_PATH = "state.json"
+_subs = set()
+_last_status = None
+_fetch_lock = asyncio.Lock()
 
-STATUS_RE = re.compile(r"ダーツ[^<]*?(満席|残\s*\d+\s*席)", re.S)
 
-async def fetch_html(url: str) -> str:
-    async with httpx.AsyncClient(http2=False, headers=HEADERS, timeout=httpx.Timeout(20.0)) as client:
-        r = await client.get(url)
-        r.raise_for_status()
-        # サーバはUTF-8。明示して安全側に。
-        r.encoding = "utf-8"
-        return r.text
+# ====== 永続もどき（JSON） ======
+def _load_json(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
 
-def parse_status(html: str) -> Optional[str]:
-    m = STATUS_RE.search(html)
-    if not m:
+
+def _save_json(path, obj):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.warning("save_json failed: %s", e)
+
+
+def load_state():
+    global _subs, _last_status
+    _subs = set(_load_json(SUBSCRIBERS_PATH, []))
+    st = _load_json(STATE_PATH, {"last_status": None})
+    _last_status = st.get("last_status")
+
+
+def save_state():
+    _save_json(SUBSCRIBERS_PATH, list(_subs))
+    _save_json(STATE_PATH, {"last_status": _last_status})
+
+
+# ====== 解析 ======
+def parse_darts_status(text: str) -> str | None:
+    """
+    本文テキストから「満席」 or 「残{n}席」を抽出。
+    空白は吸収して正規化して返す（例: '残1席'）
+    """
+    if not text:
         return None
-    text = m.group(1)
-    # 正規化
-    text = re.sub(r"\s+", "", text)
-    return text  # 例: "満席" / "残1席"
 
-async def get_shop_status() -> Optional[str]:
-    html = await fetch_html(SHOP_URL)
-    return parse_status(html)
+    # まずは「ダーツ … (満席|残n席)」パターン
+    m = re.search(r"ダーツ.*?(満席|残\s*\d+\s*席)", text, re.S)
+    if m:
+        return re.sub(r"\s+", "", m.group(1))
 
-# ====== コマンド ======
+    # 代替: 「ビリヤード/ダーツ」の行で個別数値が出るケース等もある
+    # （必要に応じてここに別パターンを追加）
+    return None
+
+
+async def fetch_status_via_playwright() -> tuple[str | None, str]:
+    """
+    Playwrightでページをレンダリングして本文からダーツの状態を抜く。
+    戻り値: (status, debug_snippet)
+    """
+    debug_snippet = ""
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True)
+            context = await browser.new_context(locale="ja-JP")
+            page = await context.new_page()
+
+            # ネットワーク静止まで待機（JS後レンダリングを待つ）
+            await page.goto(SHOP_URL, wait_until="networkidle", timeout=60_000)
+
+            # ページ全体の可視テキストを取得
+            body_text = await page.inner_text("body")
+            status = parse_darts_status(body_text)
+
+            # 見つからなかった場合、ネットワークレスポンスからvacancy系も拾ってみる
+            if status is None:
+                # 直近のHTMLを短縮してデバッグ返却用に保持
+                html = await page.content()
+                debug_snippet = (html[:1200] + "...") if len(html) > 1200 else html
+            else:
+                # 状態が取れた場合は確認用に冒頭だけ
+                debug_snippet = body_text[:300]
+
+            await context.close()
+            await browser.close()
+            logging.info("playwright status=%s", status)
+            return status, debug_snippet
+
+    except Exception as e:
+        logging.exception("fetch_status error: %s", e)
+        return None, f"error: {e!r}"
+
+
+# ====== Telegram Handlers ======
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    text = (
         "王子店『ダーツ』空席ウォッチです。\n"
-        "/on で通知ON、/off で通知OFF、/status で現在の状況。/debug は解析用です。"
+        "/on で通知ON、/off で通知OFF、/status で現在の状況。\n"
+        "/debug は解析用です。"
     )
+    await update.message.reply_text(text)
+
 
 async def cmd_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat:
-        subscribers.add(update.effective_chat.id)
+    chat_id = update.effective_chat.id
+    _subs.add(chat_id)
+    save_state()
     await update.message.reply_text("通知を ON にしました。")
 
+
 async def cmd_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat and update.effective_chat.id in subscribers:
-        subscribers.remove(update.effective_chat.id)
+    chat_id = update.effective_chat.id
+    _subs.discard(chat_id)
+    save_state()
     await update.message.reply_text("通知を OFF にしました。")
 
-def jst_now_str() -> str:
-    return (datetime.now(timezone.utc) + timedelta(hours=9)).strftime("%Y-%m-%d %H:%M:%S")
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        status = await asyncio.wait_for(get_shop_status(), timeout=HARD_TIMEOUT_SEC)
-        if status:
-            await update.message.reply_text(f"現在のダーツ: {status}（{jst_now_str()}）")
-        else:
-            await update.message.reply_text("取得に失敗しました。後でもう一度。")
-    except Exception as e:
-        log.exception("status error")
-        await update.message.reply_text(f"取得エラー: {e}")
+    async with _fetch_lock:
+        status, _ = await fetch_status_via_playwright()
+    ts = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+    if status:
+        await update.message.reply_text(f"現在のダーツ: {status}（{ts}）")
+    else:
+        await update.message.reply_text("取得に失敗しました。後でもう一度。")
+
 
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        html = await asyncio.wait_for(fetch_html(SHOP_URL), timeout=HARD_TIMEOUT_SEC)
-        # ダーツ行周辺だけを抜粋して返す（長文防止）
-        snippet = "…省略…"
-        m = STATUS_RE.search(html)
-        if m:
-            start = max(m.start() - 60, 0)
-            end = min(m.end() + 60, len(html))
-            snippet = html[start:end]
-        msg = f"status={last_status}\nURL={SHOP_URL}\n--- debug ---\n{snippet}"
-        await update.message.reply_text(msg[:3500])
-    except Exception as e:
-        log.exception("debug error")
-        await update.message.reply_text(f"debug error: {e}")
+    async with _fetch_lock:
+        status, snippet = await fetch_status_via_playwright()
+    lines = [
+        f"status={status}",
+        f"URL={SHOP_URL}",
+        "--- debug ---",
+        snippet,
+    ]
+    await update.message.reply_text("\n".join(lines))
 
-# ====== 定期ジョブ ======
+
+# ====== ジョブ（定期ポーリング） ======
 async def poll_job(context: ContextTypes.DEFAULT_TYPE):
-    global last_status
-    try:
-        status = await asyncio.wait_for(get_shop_status(), timeout=HARD_TIMEOUT_SEC)
-    except Exception as e:
-        log.warning(f"poll error: {e}")
+    global _last_status
+    async with _fetch_lock:
+        status, _ = await fetch_status_via_playwright()
+
+    logging.info("poll: status %s", status)
+    if status is None:
         return
 
-    if not status:
-        log.info("poll: status None")
-        return
-
-    if status != last_status:
-        last_status = status
-        log.info(f"status changed -> {status}")
-        text = f"【更新】 王子店ダーツ: {status}（{jst_now_str()}）\n{SHOP_URL}"
-        for chat_id in list(subscribers):
+    if status != _last_status:
+        _last_status = status
+        save_state()
+        ts = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+        msg = f"【更新】王子店ダーツ: {status}（{ts}）\n{SHOP_URL}"
+        for chat_id in list(_subs):
             try:
-                await context.bot.send_message(chat_id=chat_id, text=text)
+                await context.bot.send_message(chat_id=chat_id, text=msg)
             except Exception as e:
-                log.warning(f"send failed {chat_id}: {e}")
+                logging.warning("notify failed chat=%s err=%s", chat_id, e)
 
-# ====== main ======
+
+# ====== 起動 ======
 def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN が未設定です。")
+    load_state()
 
-    app: Application = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("on",    cmd_on))
-    app.add_handler(CommandHandler("off",   cmd_off))
-    app.add_handler(CommandHandler("status",cmd_status))
+    app.add_handler(CommandHandler("on", cmd_on))
+    app.add_handler(CommandHandler("off", cmd_off))
+    app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("debug", cmd_debug))
 
-    # 2分ごと。前回が終わらない場合はスキップ（溜めない）
-    app.job_queue.run_repeating(
-        poll_job,
-        interval=CHECK_INTERVAL_SEC,
-        first=5,
-        job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 10},
-        name="poll_job",
-    )
+    # 2分ごとに差分監視
+    app.job_queue.run_repeating(poll_job, interval=CHECK_INTERVAL_SEC, first=5)
 
-    log.info("Bot starting…")
-    app.run_polling(drop_pending_updates=True)
+    logging.info("Bot starting…")
+    # 他インスタンスとの衝突を避けるためWebhookは使わず、ロングポーリングのみ
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
