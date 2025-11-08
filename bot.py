@@ -2,9 +2,7 @@
 """
 快活クラブ 王子店『ダーツ』空席ウォッチ（Telegram版）
 /start /menu /on /off /status /debug /ping
-インラインボタン:
-  - ⛔ / ✅  … 押したら実行される“アクション”表示（現在状態ではなくアクション）
-  - 🔄 今すぐ取得 … /status 相当（同じメッセージを編集）
+日本語キーワード: 「スタート」「開始」「メニュー」 などでもメニューを表示
 """
 
 from __future__ import annotations
@@ -19,8 +17,8 @@ from typing import Optional, Tuple
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
-    ApplicationBuilder, Application, CommandHandler,
-    CallbackQueryHandler, ContextTypes
+    ApplicationBuilder, Application, CommandHandler, CallbackQueryHandler,
+    ContextTypes, MessageHandler, filters,
 )
 from playwright.async_api import async_playwright
 
@@ -38,8 +36,7 @@ log = logging.getLogger("kaikatsu-bot")
 def load_subs() -> set[int]:
     try:
         with open(SUBS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return set(int(x) for x in data)
+            return set(int(x) for x in json.load(f))
     except Exception:
         return set()
 
@@ -52,9 +49,7 @@ def save_subs(s: set[int]) -> None:
 
 SUBSCRIBERS: set[int] = load_subs()
 LAST_STATUS: Optional[str] = None
-
-# 直列ロック（手動/status と定期ジョブのバッティング回避）
-SCRAPE_LOCK = asyncio.Lock()
+SCRAPE_LOCK = asyncio.Lock()  # fetchの同時実行を1つにする
 
 # ========= ユーティリティ =========
 _Z2H = str.maketrans("０１２３４５６７８９", "0123456789")
@@ -69,25 +64,20 @@ def now_jp() -> str:
 def is_subscribed(chat_id: int) -> bool:
     return chat_id in SUBSCRIBERS
 
+def status_line(chat_id: int) -> str:
+    return "現在: 🟢 通知ON" if is_subscribed(chat_id) else "現在: 🔴 通知OFF"
+
 def menu_keyboard(chat_id: int) -> InlineKeyboardMarkup:
-    """
-    2行レイアウト：
-      1段目 = 通知ON/OFFトグル（アクション表示）
-      2段目 = 今すぐ取得
-    ラベルは短くして見切れ防止。
-    """
+    """1段目=トグル、2段目=今すぐ取得（見切れ防止で2行）"""
     on = is_subscribed(chat_id)
-    # 現在ONなら「OFFにする」ボタン、現在OFFなら「ONにする」ボタン
-    label_toggle = "⛔ 通知OFF" if on else "✅ 通知ON"
+    label_toggle = "⛔ 通知OFF" if on else "✅ 通知ON"  # “次のアクション”を表示
     btn_toggle = InlineKeyboardButton(label_toggle, callback_data="toggle_notify")
     btn_fetch  = InlineKeyboardButton("🔄 今すぐ取得", callback_data="fetch_now")
-    # ここを 2 行に分割（各行は別のリスト）
     return InlineKeyboardMarkup([[btn_toggle], [btn_fetch]])
 
 # ========= 取得＆解析 =========
 async def fetch_status(debug: bool = False, timeout_sec: int = 60) -> Tuple[Optional[str], Optional[str]]:
     async def _scrape_once() -> Tuple[Optional[str], Optional[str]]:
-        snippet = None
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
             ctx = await browser.new_context(
@@ -99,22 +89,20 @@ async def fetch_status(debug: bool = False, timeout_sec: int = 60) -> Tuple[Opti
             )
             page = await ctx.new_page()
             await page.goto(URL, wait_until="domcontentloaded", timeout=45000)
-
             for sel in ["#onetrust-accept-btn-handler", ".btn-accept", "button.accept"]:
                 try:
                     await page.locator(sel).click(timeout=1000)
                     break
                 except Exception:
                     pass
-
             await page.wait_for_timeout(1200)
             body_text = await page.evaluate("document.body.innerText")
             await browser.close()
 
         t = norm_spaces(body_text)
         pat = re.compile(r"(満席|残\s*\d+\s*席(?:以上)?)")
-
         lines = t.splitlines()
+
         for i, ln in enumerate(lines):
             if "ダーツ" in ln:
                 m = pat.search(ln)
@@ -129,9 +117,7 @@ async def fetch_status(debug: bool = False, timeout_sec: int = 60) -> Tuple[Opti
         if m:
             return m.group(1), (norm_spaces(t)[:300] if debug else None)
 
-        if debug:
-            return None, norm_spaces(t)[:700]
-        return None, None
+        return (None, norm_spaces(t)[:700] if debug else None)
 
     try:
         async with SCRAPE_LOCK:
@@ -139,8 +125,7 @@ async def fetch_status(debug: bool = False, timeout_sec: int = 60) -> Tuple[Opti
     except asyncio.TimeoutError:
         return None, "timeout"
     except Exception as e:
-        err = f"error: {e}\n{traceback.format_exc(limit=2)}"
-        return None, err
+        return None, f"error: {e}\n{traceback.format_exc(limit=2)}"
 
 # ========= コマンド =========
 INTRO = (
@@ -149,13 +134,18 @@ INTRO = (
     "下のボタンで通知ON/OFFの切替や、今すぐ取得ができます。"
 )
 
+async def _send_menu_text(chat_id: int, c: ContextTypes.DEFAULT_TYPE, replying_to: Update | None = None):
+    text = f"{INTRO}\n{status_line(chat_id)}"
+    if replying_to and replying_to.message:
+        await replying_to.message.reply_text(text, reply_markup=menu_keyboard(chat_id))
+    else:
+        await c.bot.send_message(chat_id, text, reply_markup=menu_keyboard(chat_id))
+
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = u.effective_chat.id
-    await u.message.reply_text(INTRO, reply_markup=menu_keyboard(chat_id))
+    await _send_menu_text(u.effective_chat.id, c, replying_to=u)
 
 async def cmd_menu(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = u.effective_chat.id
-    await u.message.reply_text("メニュー：", reply_markup=menu_keyboard(chat_id))
+    await _send_menu_text(u.effective_chat.id, c, replying_to=u)
 
 async def cmd_ping(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     await u.message.reply_text(f"pong ({now_jp()})")
@@ -164,13 +154,13 @@ async def cmd_on(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     SUBSCRIBERS.add(u.effective_chat.id)
     save_subs(SUBSCRIBERS)
     await u.message.reply_text("通知を ON にしました。")
-    await u.message.reply_text("メニュー：", reply_markup=menu_keyboard(u.effective_chat.id))
+    await _send_menu_text(u.effective_chat.id, c)
 
 async def cmd_off(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     SUBSCRIBERS.discard(u.effective_chat.id)
     save_subs(SUBSCRIBERS)
     await u.message.reply_text("通知を OFF にしました。")
-    await u.message.reply_text("メニュー：", reply_markup=menu_keyboard(u.effective_chat.id))
+    await _send_menu_text(u.effective_chat.id, c)
 
 async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     await u.message.reply_text("取得中…（最大 ~60 秒）")
@@ -187,6 +177,19 @@ async def cmd_debug(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         msg += f"\n--- debug ---\n{snippet}"
     await u.message.reply_text(msg)
 
+# ========= 日本語テキストでもメニューを出す =========
+_JP_MENU_WORDS = ("スタート", "開始", "メニュー", "めにゅー", "menu", "start", "help")
+
+async def on_text_keywords(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    if not u.message or not (txt := (u.message.text or "").strip()):
+        return
+    # privateチャットのみを対象（グループでの誤反応を防ぐ）
+    if u.effective_chat.type != "private":
+        return
+    # キーワードが含まれればメニュー表示
+    if any(w.lower() in txt.lower() for w in _JP_MENU_WORDS):
+        await _send_menu_text(u.effective_chat.id, c, replying_to=u)
+
 # ========= インラインボタン =========
 async def on_toggle_button(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     q = u.callback_query
@@ -202,8 +205,10 @@ async def on_toggle_button(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         save_subs(SUBSCRIBERS)
         note = "通知を ON にしました。"
 
+    # メッセージ本文にも現在状態を出す
     try:
-        await q.edit_message_reply_markup(reply_markup=menu_keyboard(chat_id))
+        await q.edit_message_text(f"{INTRO}\n{status_line(chat_id)}",
+                                  reply_markup=menu_keyboard(chat_id))
     except Exception:
         pass
     await q.message.reply_text(note)
@@ -220,9 +225,9 @@ async def on_fetch_now(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
 
     status, _ = await fetch_status(False, timeout_sec=60)
     text = f"現在のダーツ: {status}（{now_jp()}）" if status else "取得に失敗しました。"
-
     try:
-        await q.edit_message_text(text, reply_markup=menu_keyboard(chat_id))
+        await q.edit_message_text(f"{INTRO}\n{status_line(chat_id)}\n\n{text}",
+                                  reply_markup=menu_keyboard(chat_id))
     except Exception:
         await q.message.reply_text(text, reply_markup=menu_keyboard(chat_id))
 
@@ -246,15 +251,21 @@ def build_app() -> Application:
     if not TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN が未設定です。KoyebのEnvironment variablesを確認してください。")
     app = ApplicationBuilder().token(TOKEN).build()
+
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("menu", cmd_menu))
-    app.add_handler(CommandHandler("ping", cmd_ping))
-    app.add_handler(CommandHandler("on", cmd_on))
-    app.add_handler(CommandHandler("off", cmd_off))
+    app.add_handler(CommandHandler("menu",  cmd_menu))
+    app.add_handler(CommandHandler("ping",  cmd_ping))
+    app.add_handler(CommandHandler("on",    cmd_on))
+    app.add_handler(CommandHandler("off",   cmd_off))
     app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("debug", cmd_debug))
+    app.add_handler(CommandHandler("debug",  cmd_debug))
+
+    # 日本語キーワードでメニュー表示
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_keywords))
+
     app.add_handler(CallbackQueryHandler(on_toggle_button, pattern="^toggle_notify$"))
     app.add_handler(CallbackQueryHandler(on_fetch_now,   pattern="^fetch_now$"))
+
     app.job_queue.run_repeating(poll_job, interval=CHECK_INTERVAL_SEC, first=10)
     return app
 
