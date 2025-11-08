@@ -2,16 +2,14 @@
 """
 快活クラブ 王子店『ダーツ』空席ウォッチ（Telegram版）
 /start  /on  /off  /status  /debug
-
-必要パッケージ：
-  pip install "python-telegram-bot[job-queue]"==20.7 playwright==1.47.0
-  python -m playwright install chromium
 """
 
 from __future__ import annotations
+import os
 import json
 import logging
 import re
+import asyncio
 import traceback
 from datetime import datetime
 from typing import Optional, Tuple
@@ -21,9 +19,10 @@ from telegram.ext import ApplicationBuilder, Application, CommandHandler, Contex
 from playwright.async_api import async_playwright
 
 # ========= 設定 =========
-TOKEN = "8318550980:AAFylrCgbsdfGeulWL5uWm0VbpYfRWEW1zs"  # @BotFatherで再発行した新トークンを貼る
-URL = "https://www.kaikatsu.jp/shop/detail/vacancy.html?store_code=20328"  # 王子店 空席ページ
-CHECK_INTERVAL_SEC = 120
+# ※ 環境変数があれば優先（KoyebのEnvで設定できる）
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "PUT_YOUR_FALLBACK_TOKEN_HERE")
+URL = os.getenv("SHOP_URL", "https://www.kaikatsu.jp/shop/detail/vacancy.html?store_code=20328")
+CHECK_INTERVAL_SEC = int(os.getenv("CHECK_SEC", "180"))  # ← 180秒に延長
 SUBS_FILE = "subs.json"
 
 # ========= ロギング =========
@@ -58,16 +57,16 @@ def norm_spaces(s: str) -> str:
 def now_jp() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-# ========= 取得＆解析（PlaywrightでJS実行後の本文を読む） =========
+# ========= 取得＆解析 =========
 async def fetch_status(debug: bool = False) -> Tuple[Optional[str], Optional[str]]:
-    """
-    成功: (status文字列, デバッグ用スニペット)
-    失敗: (None, 例外メッセージ/スニペット)
-    """
+    """成功: (status文字列, デバッグ用スニペット) / 失敗: (None, ヒント)"""
     snippet = None
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
             ctx = await browser.new_context(
                 locale="ja-JP",
                 user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -78,6 +77,7 @@ async def fetch_status(debug: bool = False) -> Tuple[Optional[str], Optional[str
             page = await ctx.new_page()
             await page.goto(URL, wait_until="domcontentloaded", timeout=45000)
 
+            # Cookieバナー等があれば閉じる（無ければ無視）
             for sel in ["#onetrust-accept-btn-handler", ".btn-accept", "button.accept"]:
                 try:
                     await page.locator(sel).click(timeout=1000)
@@ -85,8 +85,7 @@ async def fetch_status(debug: bool = False) -> Tuple[Optional[str], Optional[str
                 except Exception:
                     pass
 
-            await page.wait_for_timeout(1200)
-
+            await page.wait_for_timeout(1200)  # 軽く待つ
             body_text = await page.evaluate("document.body.innerText")
             await browser.close()
 
@@ -120,7 +119,7 @@ async def fetch_status(debug: bool = False) -> Tuple[Optional[str], Optional[str
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     await u.message.reply_text(
         "王子店『ダーツ』空席ウォッチです。\n"
-        "/on で通知ON、/off で通知OFF、/status で現在の状況を取得、/debug は解析用です。"
+        "/on で通知ON、/off で通知OFF、/status で現在の状況、/debug は解析用です。"
     )
 
 async def cmd_on(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
@@ -147,19 +146,25 @@ async def cmd_debug(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     await u.message.reply_text(msg)
 
 # ========= 監視ジョブ =========
+_lock = asyncio.Lock()  # オーバーラップ防止
+
 async def poll_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    global LAST_STATUS
-    status, _ = await fetch_status(False)
-    if not status:
+    if _lock.locked():
+        # すでに実行中なら静かにスキップ（スケジューラのskip警告を抑制）
         return
-    if status != LAST_STATUS:
-        LAST_STATUS = status
-        text = f"【更新】王子店ダーツ: {status}（{now_jp()}）\n{URL}"
-        for chat_id in list(SUBSCRIBERS):
-            try:
-                await ctx.bot.send_message(chat_id, text)
-            except Exception as e:
-                log.warning("send failed %s: %s", chat_id, e)
+    async with _lock:
+        global LAST_STATUS
+        status, _ = await fetch_status(False)
+        if not status:
+            return
+        if status != LAST_STATUS:
+            LAST_STATUS = status
+            text = f"【更新】王子店ダーツ: {status}（{now_jp()}）\n{URL}"
+            for chat_id in list(SUBSCRIBERS):
+                try:
+                    await ctx.bot.send_message(chat_id, text)
+                except Exception as e:
+                    log.warning("send failed %s: %s", chat_id, e)
 
 def build_app() -> Application:
     app = ApplicationBuilder().token(TOKEN).build()
@@ -168,12 +173,19 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("off", cmd_off))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("debug", cmd_debug))
-    app.job_queue.run_repeating(poll_job, interval=CHECK_INTERVAL_SEC, first=5)
+    # ← ここを調整：間隔180s、max_instances=2、coalesceで取りこぼし抑制
+    app.job_queue.run_repeating(
+        poll_job,
+        interval=CHECK_INTERVAL_SEC,
+        first=5,
+        job_kwargs={"max_instances": 2, "coalesce": True, "misfire_grace_time": 60},
+        name="poll_job",
+    )
     return app
 
 def main() -> None:
     app = build_app()
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
