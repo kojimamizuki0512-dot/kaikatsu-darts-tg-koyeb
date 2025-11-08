@@ -1,0 +1,7 @@
+﻿venv/
+__pycache__/
+*.pyc
+.vscode/
+*.log
+state.json
+subs.json
