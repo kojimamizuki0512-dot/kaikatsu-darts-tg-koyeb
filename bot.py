@@ -4,10 +4,10 @@
 /start /on /off /status /debug /ping
 
 改修点:
-- asyncio.Lockでスクレイプの同時実行を防止（/status と 定期ジョブの競合を解消）
-- 60秒キャッシュで即応答（/status は直近結果を使い、force時は再取得）
-- Playwrightに総合45秒のタイムアウト
-- concurrent_updates=False でPTB側の並列処理を停止
+- asyncio.Lockでスクレイプを直列化
+- 60秒キャッシュ & 45秒タイムアウト
+- python-telegram-bot v20系: JobQueue.run_repeating へは job_kwargs=... を使用
+- concurrent_updates(False) でPTB側の並列処理を抑止
 """
 
 from __future__ import annotations
@@ -92,22 +92,17 @@ async def _scrape_once() -> Tuple[Optional[str], Optional[str]]:
     m = re.search(r"ダーツ.*?(満席|残\s*\d+\s*席(?:以上)?)", t, re.S)
     if m:
         return m.group(1), norm_spaces(t)[:300]
-    return None, norm_spaces(t)[:500]  # 未検出時はスニペット返す
+    return None, norm_spaces(t)[:500]
 
 async def fetch_status(debug: bool = False, force: bool = False) -> Tuple[Optional[str], Optional[str]]:
-    """
-    キャッシュを考慮して状態を返す。force=Trueで必ず再取得。
-    取得はロックで直列化。例外は (None, エラー文) に畳み込む。
-    """
+    """キャッシュを考慮。force=Trueなら必ず再取得。取得はLockで直列化。"""
     global _cache_ts, _cache_status, _cache_snip
     now = time.monotonic()
 
-    # キャッシュ
     if not force and _cache_status is not None and now - _cache_ts < CACHE_TTL:
         return _cache_status, (_cache_snip if debug else None)
 
     async with SCRAPE_LOCK:
-        # ロック待ちの間に他が更新してる可能性があるので再チェック
         now2 = time.monotonic()
         if not force and _cache_status is not None and now2 - _cache_ts < CACHE_TTL:
             return _cache_status, (_cache_snip if debug else None)
@@ -144,7 +139,7 @@ async def cmd_off(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     await u.message.reply_text("取得中…（最大 ~45秒）")
-    status, _ = await fetch_status(debug=False, force=True)  # 必ず最新を取りに行く
+    status, _ = await fetch_status(debug=False, force=True)
     await u.message.reply_text(
         f"現在のダーツ: {status}（{now_jp()}）" if status else "取得に失敗しました。しばらくして再実行してください。"
     )
@@ -179,15 +174,13 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("off", cmd_off))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("debug", cmd_debug))
-    # 重複起動を抑止（max_instances=1, coalesce=True）
+    # 重要: v20系は job_kwargs=... にまとめて渡す
     app.job_queue.run_repeating(
         poll_job,
         interval=CHECK_INTERVAL_SEC,
         first=10,
         name="poll_job",
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=30,
+        job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 30},
     )
     return app
 
