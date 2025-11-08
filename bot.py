@@ -3,32 +3,31 @@
 快活クラブ 王子店『ダーツ』空席ウォッチ（Telegram版）
 /start  /on  /off  /status  /debug
 
-ベース: Playwright 1.47.0（公式Docker）, PTB 20.7
+必要パッケージ：
+  pip install "python-telegram-bot[job-queue]"==20.7 playwright==1.47.0
+  python -m playwright install chromium
 """
 
 from __future__ import annotations
-import os
 import json
 import logging
 import re
 import traceback
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from typing import Optional, Tuple
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, Application, CommandHandler, ContextTypes
 from playwright.async_api import async_playwright
 
-# ========= 設定（必ずKoyebの環境変数で渡す）=========
-TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-URL = os.environ.get("SHOP_URL", "https://www.kaikatsu.jp/shop/detail/vacancy.html?store_code=20328")
-CHECK_INTERVAL_SEC = int(os.environ.get("CHECK_INTERVAL_SEC", "120"))
+# ========= 設定 =========
+TOKEN = "8318550980:AAFylrCgbsdfGeulWL5uWm0VbpYfRWEW1zs"  # @BotFatherで再発行した新トークンを貼る
+URL = "https://www.kaikatsu.jp/shop/detail/vacancy.html?store_code=20328"  # 王子店 空席ページ
+CHECK_INTERVAL_SEC = 120
 SUBS_FILE = "subs.json"
 
-JST = timezone(timedelta(hours=9))
-
 # ========= ロギング =========
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("kaikatsu-bot")
 
 # ========= 通知先の保存 =========
@@ -57,7 +56,7 @@ def norm_spaces(s: str) -> str:
     return re.sub(r"[\u3000\t ]+", " ", s)
 
 def now_jp() -> str:
-    return datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 # ========= 取得＆解析（PlaywrightでJS実行後の本文を読む） =========
 async def fetch_status(debug: bool = False) -> Tuple[Optional[str], Optional[str]]:
@@ -68,7 +67,7 @@ async def fetch_status(debug: bool = False) -> Tuple[Optional[str], Optional[str
     snippet = None
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
             ctx = await browser.new_context(
                 locale="ja-JP",
                 user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -79,7 +78,6 @@ async def fetch_status(debug: bool = False) -> Tuple[Optional[str], Optional[str
             page = await ctx.new_page()
             await page.goto(URL, wait_until="domcontentloaded", timeout=45000)
 
-            # Cookieバナーがあれば閉じる（無ければスルー）
             for sel in ["#onetrust-accept-btn-handler", ".btn-accept", "button.accept"]:
                 try:
                     await page.locator(sel).click(timeout=1000)
@@ -87,7 +85,6 @@ async def fetch_status(debug: bool = False) -> Tuple[Optional[str], Optional[str
                 except Exception:
                     pass
 
-            # レイアウトが落ち着くまで少し待つ
             await page.wait_for_timeout(1200)
 
             body_text = await page.evaluate("document.body.innerText")
@@ -95,7 +92,6 @@ async def fetch_status(debug: bool = False) -> Tuple[Optional[str], Optional[str
 
         t = norm_spaces(body_text)
 
-        # 近傍抽出：「ダーツ」行の近くから 満席 / 残X席(以上) を探す
         pat = re.compile(r"(満席|残\s*\d+\s*席(?:以上)?)")
         lines = t.splitlines()
         for i, ln in enumerate(lines):
@@ -103,12 +99,11 @@ async def fetch_status(debug: bool = False) -> Tuple[Optional[str], Optional[str
                 m = pat.search(ln)
                 if m:
                     return m.group(1), (norm_spaces(ln)[:200] if debug else None)
-                ctx = " ".join(lines[i:i+3])
-                m = pat.search(ctx)
+                ctx2 = " ".join(lines[i:i+3])
+                m = pat.search(ctx2)
                 if m:
-                    return m.group(1), (norm_spaces(ctx)[:200] if debug else None)
+                    return m.group(1), (norm_spaces(ctx2)[:200] if debug else None)
 
-        # 全体からの緩め抽出
         m = re.search(r"ダーツ.*?(満席|残\s*\d+\s*席(?:以上)?)", t, re.S)
         if m:
             return m.group(1), (norm_spaces(t)[:300] if debug else None)
@@ -178,8 +173,7 @@ def build_app() -> Application:
 
 def main() -> None:
     app = build_app()
-    # 409回避：ローカル/別インスタンスは必ず止める
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
