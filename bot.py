@@ -2,11 +2,9 @@
 """
 快活クラブ 王子店『ダーツ』空席ウォッチ（Telegram版）
 /start /menu /on /off /status /debug /ping
-インラインボタンで通知ON/OFFをワンタップ切替
-
-必要パッケージ：
-  python-telegram-bot[job-queue]==20.7
-  playwright==1.48.0  （Dockerでchromiumは --with-deps で導入）
+インラインボタン:
+  - ✅/⛔ 通知ON/OFF をワンタップ切替（表示も即更新）
+  - 🔄 今すぐ取得（/status 相当）→ 同メッセージを編集
 """
 
 from __future__ import annotations
@@ -55,7 +53,7 @@ def save_subs(s: set[int]) -> None:
 SUBSCRIBERS: set[int] = load_subs()
 LAST_STATUS: Optional[str] = None
 
-# 直列実行ロック（/status と定期ジョブの同時実行を防ぐ）
+# 直列ロック（手動/status と定期ジョブのバッティング回避）
 SCRAPE_LOCK = asyncio.Lock()
 
 # ========= ユーティリティ =========
@@ -71,13 +69,13 @@ def now_jp() -> str:
 def is_subscribed(chat_id: int) -> bool:
     return chat_id in SUBSCRIBERS
 
-def toggle_keyboard(chat_id: int) -> InlineKeyboardMarkup:
-    # 現在の状態に応じてボタン表示を切替
+def menu_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     on = is_subscribed(chat_id)
-    label = f"通知: {'ON' if on else 'OFF'}（タップで切替）"
-    return InlineKeyboardMarkup.from_row([
-        InlineKeyboardButton(label, callback_data="toggle_notify")
-    ])
+    label_toggle = f"{'✅' if on else '⛔'} 通知: {'ON' if on else 'OFF'}（タップで切替）"
+    btn_toggle = InlineKeyboardButton(label_toggle, callback_data="toggle_notify")
+    btn_fetch  = InlineKeyboardButton("🔄 今すぐ取得", callback_data="fetch_now")
+    # 1行に2ボタン
+    return InlineKeyboardMarkup([[btn_toggle, btn_fetch]])
 
 # ========= 取得＆解析 =========
 async def fetch_status(debug: bool = False, timeout_sec: int = 60) -> Tuple[Optional[str], Optional[str]]:
@@ -99,7 +97,7 @@ async def fetch_status(debug: bool = False, timeout_sec: int = 60) -> Tuple[Opti
             page = await ctx.new_page()
             await page.goto(URL, wait_until="domcontentloaded", timeout=45000)
 
-            # Cookie などのバナーを雑に閉じる（存在しなければ無視）
+            # Cookie などのバナーがあれば閉じる（なければ無視）
             for sel in ["#onetrust-accept-btn-handler", ".btn-accept", "button.accept"]:
                 try:
                     await page.locator(sel).click(timeout=1000)
@@ -134,7 +132,6 @@ async def fetch_status(debug: bool = False, timeout_sec: int = 60) -> Tuple[Opti
         return None, None
 
     try:
-        # ロックで直列化（pollと手動/statusのバッティング回避）
         async with SCRAPE_LOCK:
             return await asyncio.wait_for(_scrape_once(), timeout=timeout_sec)
     except asyncio.TimeoutError:
@@ -144,18 +141,19 @@ async def fetch_status(debug: bool = False, timeout_sec: int = 60) -> Tuple[Opti
         return None, err
 
 # ========= コマンド =========
+INTRO = (
+    "王子店『ダーツ』空席ウォッチです。\n"
+    "/on で通知ON、/off で通知OFF、/status で現在の状況、/debug は解析用、/ping は疎通チェックです。\n"
+    "下のボタンで通知ON/OFFの切替や、今すぐ取得ができます。"
+)
+
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = u.effective_chat.id
-    text = (
-        "王子店『ダーツ』空席ウォッチです。\n"
-        "/on で通知ON、/off で通知OFF、/status で現在の状況、/debug は解析用、/ping は疎通チェックです。\n"
-        "下のボタンで通知のON/OFFをワンタップ切替できます。"
-    )
-    await u.message.reply_text(text, reply_markup=toggle_keyboard(chat_id))
+    await u.message.reply_text(INTRO, reply_markup=menu_keyboard(chat_id))
 
 async def cmd_menu(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = u.effective_chat.id
-    await u.message.reply_text("通知の設定：", reply_markup=toggle_keyboard(chat_id))
+    await u.message.reply_text("メニュー：", reply_markup=menu_keyboard(chat_id))
 
 async def cmd_ping(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     await u.message.reply_text(f"pong ({now_jp()})")
@@ -185,9 +183,8 @@ async def cmd_debug(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         msg += f"\n--- debug ---\n{snippet}"
     await u.message.reply_text(msg)
 
-# ========= インラインボタンの処理 =========
+# ========= インラインボタン =========
 async def on_toggle_button(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
-    """通知ON/OFFをトグルし、同じメッセージのボタン表示を更新"""
     q = u.callback_query
     await q.answer()
     chat_id = q.message.chat_id
@@ -201,14 +198,33 @@ async def on_toggle_button(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         save_subs(SUBSCRIBERS)
         note = "通知を ON にしました。"
 
-    # ボタン表記を更新
+    # ボタンだけ更新
     try:
-        await q.edit_message_reply_markup(reply_markup=toggle_keyboard(chat_id))
+        await q.edit_message_reply_markup(reply_markup=menu_keyboard(chat_id))
     except Exception:
-        # 失敗したらそのまま（古いメッセージ等）
         pass
-
     await q.message.reply_text(note)
+
+async def on_fetch_now(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    q = u.callback_query
+    await q.answer()
+    chat_id = q.message.chat_id
+
+    # まずメッセージを「取得中…」に編集（同じメッセージを使い回す）
+    try:
+        await q.edit_message_text("取得中…（最大 ~60 秒）", reply_markup=menu_keyboard(chat_id))
+    except Exception:
+        # 権限や古いメッセージで編集できない場合、別メッセージで案内
+        await q.message.reply_text("取得中…（最大 ~60 秒）")
+
+    status, _ = await fetch_status(False, timeout_sec=60)
+    text = f"現在のダーツ: {status}（{now_jp()}）" if status else "取得に失敗しました。"
+
+    # 結果で同じメッセージを上書き
+    try:
+        await q.edit_message_text(text, reply_markup=menu_keyboard(chat_id))
+    except Exception:
+        await q.message.reply_text(text, reply_markup=menu_keyboard(chat_id))
 
 # ========= 監視ジョブ =========
 async def poll_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -241,16 +257,16 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("debug", cmd_debug))
 
-    # インラインボタン
+    # コールバック
     app.add_handler(CallbackQueryHandler(on_toggle_button, pattern="^toggle_notify$"))
+    app.add_handler(CallbackQueryHandler(on_fetch_now,   pattern="^fetch_now$"))
 
-    # 監視ジョブ（並走を避けたいので1本のみ・間隔は環境変数で変更可）
+    # 定期ジョブ
     app.job_queue.run_repeating(poll_job, interval=CHECK_INTERVAL_SEC, first=10)
     return app
 
 def main() -> None:
     app = build_app()
-    # Update.ALL_TYPES だとWebHook停止直後の残Updateも拾いやすい
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
