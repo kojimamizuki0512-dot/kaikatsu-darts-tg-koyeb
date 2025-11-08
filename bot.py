@@ -11,7 +11,7 @@ import logging
 import os
 import re
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone, timedelta  # ← JST用に追加
 from typing import Optional, Tuple
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
@@ -52,13 +52,15 @@ SCRAPE_LOCK = asyncio.Lock()  # fetchの同時実行を1つにする
 
 # ========= ユーティリティ =========
 _Z2H = str.maketrans("０１２３４５６７８９", "0123456789")
+JST = timezone(timedelta(hours=9), name="JST")  # tzdata不要で安全
 
 def norm_spaces(s: str) -> str:
     s = s.translate(_Z2H)
     return re.sub(r"[\u3000\t ]+", " ", s)
 
 def now_jp() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # 日本時間で表示
+    return datetime.now(tz=JST).strftime("%Y-%m-%d %H:%M:%S")
 
 def is_subscribed(chat_id: int) -> bool:
     return chat_id in SUBSCRIBERS
@@ -69,7 +71,7 @@ def status_line(chat_id: int) -> str:
 def menu_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     """1段目=トグル、2段目=今すぐ取得（見切れ防止で2行）"""
     on = is_subscribed(chat_id)
-    label_toggle = "⛔ 通知OFF" if on else "✅ 通知ON"  # 次のアクション
+    label_toggle = "⛔ 通知OFF" if on else "✅ 通知ON"  # 次に実行される動作
     btn_toggle = InlineKeyboardButton(label_toggle, callback_data="toggle_notify")
     btn_fetch  = InlineKeyboardButton("🔄 今すぐ取得", callback_data="fetch_now")
     return InlineKeyboardMarkup([[btn_toggle], [btn_fetch]])
@@ -129,19 +131,19 @@ async def fetch_status(debug: bool = False, timeout_sec: int = 60) -> Tuple[Opti
 # ========= 表示テキスト =========
 INTRO = "快活クラブ『ダーツ』空席ウォッチ。下のボタンで通知ON/OFFの切替や、今すぐ取得ができます。"
 
-async def _send_menu_text(chat_id: int, c: ContextTypes.DEFAULT_TYPE, replying_to: Update | None = None):
+async def send_menu_message(chat_id: int, c: ContextTypes.DEFAULT_TYPE, extra: str | None = None):
+    """メニュー文＋現在状態＋（任意で）結果テキストを**新しいメッセージで**送る"""
     text = f"{INTRO}\n{status_line(chat_id)}"
-    if replying_to and replying_to.message:
-        await replying_to.message.reply_text(text, reply_markup=menu_keyboard(chat_id))
-    else:
-        await c.bot.send_message(chat_id, text, reply_markup=menu_keyboard(chat_id))
+    if extra:
+        text += f"\n\n{extra}"
+    await c.bot.send_message(chat_id, text, reply_markup=menu_keyboard(chat_id))
 
 # ========= コマンド =========
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
-    await _send_menu_text(u.effective_chat.id, c, replying_to=u)
+    await send_menu_message(u.effective_chat.id, c)
 
 async def cmd_menu(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
-    await _send_menu_text(u.effective_chat.id, c, replying_to=u)
+    await send_menu_message(u.effective_chat.id, c)
 
 async def cmd_ping(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     await u.message.reply_text(f"pong ({now_jp()})")
@@ -150,23 +152,20 @@ async def cmd_on(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     SUBSCRIBERS.add(u.effective_chat.id)
     save_subs(SUBSCRIBERS)
     await u.message.reply_text("通知を ON にしました。")
-    await _send_menu_text(u.effective_chat.id, c)
+    await send_menu_message(u.effective_chat.id, c)
 
 async def cmd_off(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     SUBSCRIBERS.discard(u.effective_chat.id)
     save_subs(SUBSCRIBERS)
     await u.message.reply_text("通知を OFF にしました。")
-    await _send_menu_text(u.effective_chat.id, c)
+    await send_menu_message(u.effective_chat.id, c)
 
 async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
-    await u.message.reply_text("取得中…（最大 ~60 秒）")
     status, _ = await fetch_status(False, timeout_sec=60)
-    await u.message.reply_text(
-        f"現在のダーツ: {status}（{now_jp()}）" if status else "取得に失敗しました。"
-    )
+    extra = f"現在のダーツ: {status}（{now_jp()}）" if status else "取得に失敗しました。"
+    await send_menu_message(u.effective_chat.id, c, extra=extra)
 
 async def cmd_debug(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
-    await u.message.reply_text("取得中…（最大 ~60 秒）")
     status, snippet = await fetch_status(True, timeout_sec=60)
     msg = f"status={status}\nURL={URL}"
     if snippet:
@@ -182,7 +181,7 @@ async def on_text_keywords(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     if u.effective_chat.type != "private":
         return
     if any(w.lower() in txt.lower() for w in _JP_MENU_WORDS):
-        await _send_menu_text(u.effective_chat.id, c, replying_to=u)
+        await send_menu_message(u.effective_chat.id, c)
 
 # ========= インラインボタン =========
 async def on_toggle_button(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
@@ -199,11 +198,7 @@ async def on_toggle_button(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         save_subs(SUBSCRIBERS)
         note = "通知を ON にしました。"
 
-    try:
-        await q.edit_message_text(f"{INTRO}\n{status_line(chat_id)}",
-                                  reply_markup=menu_keyboard(chat_id))
-    except Exception:
-        pass
+    await send_menu_message(chat_id, c)   # 新しいメッセージでメニュー再掲
     await q.message.reply_text(note)
 
 async def on_fetch_now(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
@@ -211,18 +206,10 @@ async def on_fetch_now(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     await q.answer()
     chat_id = q.message.chat_id
 
-    try:
-        await q.edit_message_text("取得中…（最大 ~60 秒）", reply_markup=menu_keyboard(chat_id))
-    except Exception:
-        await q.message.reply_text("取得中…（最大 ~60 秒）")
-
+    # 既存メッセージは触らず、新しいメッセージで結果＋メニューを投下
     status, _ = await fetch_status(False, timeout_sec=60)
-    text = f"現在のダーツ: {status}（{now_jp()}）" if status else "取得に失敗しました。"
-    try:
-        await q.edit_message_text(f"{INTRO}\n{status_line(chat_id)}\n\n{text}",
-                                  reply_markup=menu_keyboard(chat_id))
-    except Exception:
-        await q.message.reply_text(text, reply_markup=menu_keyboard(chat_id))
+    extra = f"現在のダーツ: {status}（{now_jp()}）" if status else "取得に失敗しました。"
+    await send_menu_message(chat_id, c, extra=extra)
 
 # ========= 監視ジョブ =========
 async def poll_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
