@@ -27,14 +27,13 @@ from playwright.async_api import async_playwright
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 URL = os.getenv("SHOP_URL", "https://www.kaikatsu.jp/shop/detail/vacancy.html?store_code=20328")
 CHECK_INTERVAL_SEC = 120
-
 SUBS_FILE = "subs.json"
 
-# --- 時刻（tzdata が無い環境でも動くフォールバック） ---
+# --- JST（tzdata が無い環境でも動くフォールバック） ---
 try:
     TZ = ZoneInfo("Asia/Tokyo")
 except Exception:
-    TZ = timezone(timedelta(hours=9))  # UTC+9 (JSTフォールバック)
+    TZ = timezone(timedelta(hours=9))  # UTC+9
 
 # ========= ロギング =========
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -56,9 +55,8 @@ def _save_subs(s: set[int]) -> None:
         log.warning("save_subs: %s", e)
 
 SUBSCRIBERS: set[int] = _load_subs()
-
-LAST_STATUS_STR: Optional[str] = None   # 例: "満席" / "残 2 席"
-LAST_AT: Optional[datetime] = None      # JST
+LAST_STATUS_STR: Optional[str] = None
+LAST_AT: Optional[datetime] = None
 
 # ========= ユーティリティ =========
 _Z2H = str.maketrans("０１２３４５６７８９", "0123456789")
@@ -81,7 +79,7 @@ def onoff_emoji(is_on: bool) -> str:
     return "🟢" if is_on else "🔴"
 
 def build_keyboard(is_on: bool) -> InlineKeyboardMarkup:
-    # 「今の状態に対して次にやる操作」をボタンに出す
+    # 次の操作を出す
     toggle_label = "⛔ 通知OFF" if is_on else "✅ 通知ON"
     kb = [
         [InlineKeyboardButton(toggle_label, callback_data="toggle")],
@@ -98,7 +96,6 @@ def menu_text(is_on: bool) -> str:
 
 # ========= スクレイプ =========
 async def _scrape_once() -> Tuple[Optional[str], Optional[datetime], Optional[str]]:
-    """成功: (status, now_jst, snippet) / 失敗: (None, None, snippet/err)"""
     snippet = None
     try:
         async with async_playwright() as p:
@@ -112,15 +109,12 @@ async def _scrape_once() -> Tuple[Optional[str], Optional[datetime], Optional[st
             )
             page = await ctx.new_page()
             await page.goto(URL, wait_until="domcontentloaded", timeout=45000)
-
-            # Cookie同意などがあれば閉じる（無ければ無視）
             for sel in ["#onetrust-accept-btn-handler", ".btn-accept", "button.accept"]:
                 try:
                     await page.locator(sel).click(timeout=800)
                     break
                 except Exception:
                     pass
-
             await page.wait_for_timeout(1200)
             body_text = await page.evaluate("document.body.innerText")
             await browser.close()
@@ -157,7 +151,7 @@ async def fetch_status() -> Tuple[Optional[str], Optional[datetime]]:
     except asyncio.TimeoutError:
         return None, None
 
-# ========= メニュー表示 =========
+# ========= メニュー編集 =========
 async def edit_menu(message, is_on: bool) -> None:
     try:
         await message.edit_text(menu_text(is_on), reply_markup=build_keyboard(is_on))
@@ -181,7 +175,7 @@ async def animate_spinner(message, stop_event: asyncio.Event):
         await asyncio.sleep(0.6)
         i += 1
 
-# ========= ジョブ（状態変化時のみ通知） =========
+# ========= 定期ジョブ =========
 async def poll_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     global LAST_STATUS_STR, LAST_AT
     st, at = await fetch_status()
@@ -205,24 +199,22 @@ async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"pong（{fmt_jst(datetime.now(TZ))}）")
 
 async def on_text_start_like(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    # 「開始」「スタート」で /start 相当
     await send_menu(update.effective_chat.id, ctx)
 
 async def on_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """ON→取得して反映、OFF→取得せずキャッシュだけ表示して即OFF。"""
+    """ON→取得して反映（同じメッセ編集）。OFF→取得せずキャッシュで即OFF（同じメッセ編集）。"""
     q = update.callback_query
     await q.answer()
     chat_id = q.message.chat_id
     is_on = chat_id in SUBSCRIBERS
 
     if is_on:
-        # -> OFF（新規取得しない）
+        # -> OFF（新規取得しない／新規メッセージは送らない）
         SUBSCRIBERS.discard(chat_id)
         _save_subs(SUBSCRIBERS)
         await edit_menu(q.message, False)
-        await ctx.bot.send_message(chat_id, "通知を OFF にしました。")
     else:
-        # -> ON（取得中はスピナー）
+        # -> ON（スピナー→取得→同じメッセ編集）
         stop = asyncio.Event()
         spinner_task = asyncio.create_task(animate_spinner(q.message, stop))
         st, at = await fetch_status()
@@ -238,7 +230,6 @@ async def on_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         SUBSCRIBERS.add(chat_id)
         _save_subs(SUBSCRIBERS)
         await edit_menu(q.message, True)
-        await ctx.bot.send_message(chat_id, "通知を ON にしました。")
 
 async def on_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """今すぐ取得：同一メッセージをスピナー表示→完了後メニューに再編集"""
@@ -280,7 +271,6 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^(開始|スタート)$"), on_text_start_like))
-
     app.add_handler(CallbackQueryHandler(on_toggle, pattern="^toggle$"))
     app.add_handler(CallbackQueryHandler(on_refresh, pattern="^refresh$"))
 
