@@ -1,8 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-快活クラブ 王子店『ダーツ』空席ウォッチ（Telegram版）
-- ボタン：通知ON/OFF 切替、今すぐ取得（同一メッセージ編集）
-- 取得中はスピナー表示
+快活クラブ 王子店『ダーツ』空席ウォッチ（Telegram 版）
+- ワンタップで通知ON/OFF切替
+- 「今すぐ取得」はメッセージを編集してスピナー→結果に更新
+- 通知ON時のみポーリング通知（変化があれば新規メッセージで通知）
+
+必要パッケージ（requirements.txt 例）:
+python-telegram-bot[job-queue]==20.7
+playwright==1.47.0
+tzdata==2024.1
 """
 
 from __future__ import annotations
@@ -12,274 +18,283 @@ import logging
 import os
 import re
 import traceback
-from datetime import datetime, timedelta, timezone
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from datetime import datetime
 from zoneinfo import ZoneInfo
+from typing import Optional, Tuple, Dict, Set
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import (
-    Application, ApplicationBuilder, CallbackQueryHandler, CommandHandler,
-    ContextTypes, MessageHandler, filters
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
 )
+from telegram.ext import (
+    ApplicationBuilder,
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
+
 from playwright.async_api import async_playwright
 
-# ========= 設定 =========
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-URL = os.getenv("SHOP_URL", "https://www.kaikatsu.jp/shop/detail/vacancy.html?store_code=20328")
+# ====== 設定 ======
+# ★ここはあなたの現行のやり方（直書き or 環境変数）に合わせてください
+TOKEN = os.getenv("BOT_TOKEN", "REPLACE_ME")  # 直書きの場合はここにトークンを入れる
+URL = "https://www.kaikatsu.jp/shop/detail/vacancy.html?store_code=20328"
 CHECK_INTERVAL_SEC = 120
 SUBS_FILE = "subs.json"
 
-# --- JST（tzdata が無い環境でも動くフォールバック） ---
-try:
-    TZ = ZoneInfo("Asia/Tokyo")
-except Exception:
-    TZ = timezone(timedelta(hours=9))  # UTC+9
+TZ = ZoneInfo("Asia/Tokyo")
 
-# ========= ロギング =========
+# ====== ログ ======
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("kaikatsu-bot")
 
-# ========= 状態保存 =========
-def _load_subs() -> set[int]:
+# ====== 状態 ======
+def _load_json(path: str, fallback):
     try:
-        with open(SUBS_FILE, "r", encoding="utf-8") as f:
-            return set(json.load(f))
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
-        return set()
+        return fallback
 
-def _save_subs(s: set[int]) -> None:
+def _save_json(path: str, obj) -> None:
     try:
-        with open(SUBS_FILE, "w", encoding="utf-8") as f:
-            json.dump(list(s), f, ensure_ascii=False, indent=2)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        log.warning("save_subs: %s", e)
+        log.warning("save_json: %s", e)
 
-SUBSCRIBERS: set[int] = _load_subs()
-LAST_STATUS_STR: Optional[str] = None
-LAST_AT: Optional[datetime] = None
+SUBSCRIBERS: Set[int] = set(_load_json(SUBS_FILE, []))
 
-# ========= ユーティリティ =========
+@dataclass
+class Last:
+    status: Optional[str] = None      # 例: "満席" / "残 2 席"
+    at: Optional[str] = None          # 例: "2025-11-14 18:12:34"
+
+LAST_BY_CHAT: Dict[int, Last] = {}    # chat_id -> Last
+
+# ====== ユーティリティ ======
 _Z2H = str.maketrans("０１２３４５６７８９", "0123456789")
 
 def norm_spaces(s: str) -> str:
     s = s.translate(_Z2H)
     return re.sub(r"[\u3000\t ]+", " ", s)
 
-def fmt_jst(dt: Optional[datetime]) -> str:
-    if not dt:
-        return "未取得"
-    return dt.astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+def now_jp_str() -> str:
+    return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
 
-def status_line() -> str:
-    if LAST_STATUS_STR and LAST_AT:
-        return f"現在のダーツ: {LAST_STATUS_STR}（{fmt_jst(LAST_AT)}）"
-    return "現在のダーツ: 未取得"
+def is_on(chat_id: int) -> bool:
+    return chat_id in SUBSCRIBERS
 
-def onoff_emoji(is_on: bool) -> str:
-    return "🟢" if is_on else "🔴"
+def set_on(chat_id: int, on: bool) -> None:
+    if on:
+        SUBSCRIBERS.add(chat_id)
+    else:
+        SUBSCRIBERS.discard(chat_id)
+    _save_json(SUBS_FILE, list(SUBSCRIBERS))
 
-def build_keyboard(is_on: bool) -> InlineKeyboardMarkup:
-    # 次の操作を出す
-    toggle_label = "⛔ 通知OFF" if is_on else "✅ 通知ON"
-    kb = [
-        [InlineKeyboardButton(toggle_label, callback_data="toggle")],
-        [InlineKeyboardButton("🔄 今すぐ取得", callback_data="refresh")],
-    ]
-    return InlineKeyboardMarkup(kb)
+def get_last(chat_id: int) -> Last:
+    return LAST_BY_CHAT.setdefault(chat_id, Last())
 
-def menu_text(is_on: bool) -> str:
-    return (
+def set_last(chat_id: int, status: Optional[str], at: Optional[str]) -> None:
+    LAST_BY_CHAT[chat_id] = Last(status=status, at=at)
+
+def build_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    # ボタンは「次の行動」を書く（ONならOFFボタンを出す）
+    if is_on(chat_id):
+        toggle = InlineKeyboardButton("⛔ 通知OFF", callback_data="toggle_off")
+    else:
+        toggle = InlineKeyboardButton("✅ 通知ON", callback_data="toggle_on")
+    getnow = InlineKeyboardButton("🔄 今すぐ取得", callback_data="get_now")
+    return InlineKeyboardMarkup([[toggle], [getnow]])
+
+def render_menu_text(chat_id: int, fetching: bool = False) -> str:
+    on = is_on(chat_id)
+    lamp = "🟢 通知ON" if on else "🔴 通知OFF"
+    last = get_last(chat_id)
+
+    head = (
         "快活クラブ『ダーツ』空席ウォッチ。下のボタンで通知ON/OFFの切替や、今すぐ取得ができます。\n"
-        f"現在: {onoff_emoji(is_on)} 通知{'ON' if is_on else 'OFF'}\n\n"
-        f"{status_line()}"
+        f"現在: {lamp}\n"
     )
 
-# ========= スクレイプ =========
-async def _scrape_once() -> Tuple[Optional[str], Optional[datetime], Optional[str]]:
+    if fetching:
+        body = "現在のダーツ: 取得中…（最大 ~60 秒）"
+    else:
+        if last.status and last.at:
+            body = f"現在のダーツ: {last.status}（{last.at}）"
+        else:
+            body = "現在のダーツ: 取得できていません"
+
+    return f"{head}\n{body}"
+
+# ====== 取得（Playwright） ======
+async def _scrape_once() -> Tuple[Optional[str], Optional[str]]:
     snippet = None
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-            ctx = await browser.new_context(
-                locale="ja-JP",
-                user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/120.0 Safari/537.36"),
-                java_script_enabled=True,
-            )
-            page = await ctx.new_page()
-            await page.goto(URL, wait_until="domcontentloaded", timeout=45000)
-            for sel in ["#onetrust-accept-btn-handler", ".btn-accept", "button.accept"]:
-                try:
-                    await page.locator(sel).click(timeout=800)
-                    break
-                except Exception:
-                    pass
-            await page.wait_for_timeout(1200)
-            body_text = await page.evaluate("document.body.innerText")
-            await browser.close()
-
-        t = norm_spaces(body_text)
-        pat = re.compile(r"(満席|残\s*\d+\s*席(?:以上)?)")
-
-        lines = t.splitlines()
-        for i, ln in enumerate(lines):
-            if "ダーツ" in ln:
-                m = pat.search(ln)
-                if m:
-                    return m.group(1), datetime.now(TZ), None
-                ctx = " ".join(lines[i:i+3])
-                m = pat.search(ctx)
-                if m:
-                    return m.group(1), datetime.now(TZ), None
-
-        m = re.search(r"ダーツ.*?(満席|残\s*\d+\s*席(?:以上)?)", t, re.S)
-        if m:
-            return m.group(1), datetime.now(TZ), None
-
-        snippet = norm_spaces(t)[:600]
-        return None, None, snippet
-
-    except Exception as e:
-        err = f"error: {e}\n{traceback.format_exc(limit=2)}"
-        return None, None, err
-
-async def fetch_status() -> Tuple[Optional[str], Optional[datetime]]:
-    try:
-        st, at, _ = await asyncio.wait_for(_scrape_once(), timeout=60)
-        return st, at
-    except asyncio.TimeoutError:
-        return None, None
-
-# ========= メニュー編集 =========
-async def edit_menu(message, is_on: bool) -> None:
-    try:
-        await message.edit_text(menu_text(is_on), reply_markup=build_keyboard(is_on))
-    except Exception as e:
-        log.warning("edit_menu failed: %s", e)
-
-async def send_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    is_on = chat_id in SUBSCRIBERS
-    await ctx.bot.send_message(chat_id, menu_text(is_on), reply_markup=build_keyboard(is_on))
-
-# ========= スピナー =========
-SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-
-async def animate_spinner(message, stop_event: asyncio.Event):
-    i = 0
-    while not stop_event.is_set():
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+        ctx = await browser.new_context(
+            locale="ja-JP",
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0 Safari/537.36"),
+            java_script_enabled=True,
+        )
+        page = await ctx.new_page()
+        await page.goto(URL, wait_until="domcontentloaded", timeout=45000)
+        # 表示が遅いケースに備え追加待機
         try:
-            await message.edit_text(f"取得中… {SPINNER_FRAMES[i % len(SPINNER_FRAMES)]}")
+            await page.wait_for_load_state("networkidle", timeout=8000)
         except Exception:
             pass
-        await asyncio.sleep(0.6)
-        i += 1
+        try:
+            await page.wait_for_selector("text=ダーツ", timeout=8000)
+        except Exception:
+            pass
 
-# ========= 定期ジョブ =========
+        text = await page.evaluate("document.body.innerText")
+        await browser.close()
+
+    t = norm_spaces(text)
+    pat = re.compile(r"(満席|残\s*\d+\s*席(?:以上)?|受付停止|準備中|休止|営業時間外)")
+    lines = t.splitlines()
+    for i, ln in enumerate(lines):
+        if "ダーツ" in ln:
+            m = pat.search(ln)
+            if m:
+                return m.group(1), None
+            ctx = " ".join(lines[i:i+3])
+            m = pat.search(ctx)
+            if m:
+                return m.group(1), None
+
+    m = re.search(r"ダーツ.*?(満席|残\s*\d+\s*席(?:以上)?|受付停止|準備中|休止|営業時間外)", t, re.S)
+    if m:
+        return m.group(1), None
+
+    snippet = t[:700]
+    return None, snippet
+
+async def fetch_status() -> Tuple[Optional[str], Optional[str]]:
+    """成功: (status, None) / 失敗: (None, snippet_or_error)"""
+    try:
+        return await asyncio.wait_for(_scrape_once(), timeout=45)
+    except Exception as e:
+        return None, f"error: {e}\n{traceback.format_exc(limit=1)}"
+
+# ====== ハンドラ ======
+async def send_or_edit_menu(u: Update, c: ContextTypes.DEFAULT_TYPE, fetching: bool = False) -> None:
+    chat_id = u.effective_chat.id
+    text = render_menu_text(chat_id, fetching=fetching)
+    kb = build_keyboard(chat_id)
+
+    # メニューは常に「編集」優先。編集できなければ新規送信。
+    try:
+        if u.callback_query and u.callback_query.message:
+            await u.callback_query.edit_message_text(text, reply_markup=kb)
+        else:
+            # /start などは新規メッセージ
+            await c.bot.send_message(chat_id, text, reply_markup=kb)
+    except Exception as e:
+        log.info("edit failed -> send new: %s", e)
+        await c.bot.send_message(chat_id, text, reply_markup=kb)
+
+async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = u.effective_chat.id
+    # 起動直後は“直近キャッシュ or 直取り”で描画
+    if not get_last(chat_id).status:
+        status, _ = await fetch_status()
+        if status:
+            set_last(chat_id, status, now_jp_str())
+    await send_or_edit_menu(u, c, fetching=False)
+
+async def msg_start_ja(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    # 「スタート」「開始」にも反応
+    await cmd_start(u, c)
+
+async def on_toggle(u: Update, c: ContextTypes.DEFAULT_TYPE, to_on: bool) -> None:
+    q = u.callback_query
+    await q.answer()  # 先に押下応答
+    chat_id = u.effective_chat.id
+    set_on(chat_id, to_on)
+
+    if to_on:
+        # ONに切り替えたら即取得して反映
+        await send_or_edit_menu(u, c, fetching=True)
+        status, _ = await fetch_status()
+        if status:
+            set_last(chat_id, status, now_jp_str())
+        else:
+            # 取得失敗でも時刻は更新して「失敗」を表示し、次回ポーリングで回復
+            set_last(chat_id, "取得失敗", now_jp_str())
+        await send_or_edit_menu(u, c, fetching=False)
+    else:
+        # OFFは取得せず、手元の最新キャッシュで表示だけ更新
+        await send_or_edit_menu(u, c, fetching=False)
+
+async def on_get_now(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    q = u.callback_query
+    await q.answer()
+    chat_id = u.effective_chat.id
+
+    # 1) スピナー表示に編集
+    await send_or_edit_menu(u, c, fetching=True)
+    # 2) 取得（成否に関わらず時刻は更新して再描画＝毎回“更新感”が出る）
+    status, _ = await fetch_status()
+    if status:
+        set_last(chat_id, status, now_jp_str())
+    else:
+        # 失敗時は内容は触らず時刻だけ更新（「取得できていません」を回避したいならここで文言をセット）
+        last = get_last(chat_id)
+        set_last(chat_id, last.status or "取得失敗", now_jp_str())
+
+    await send_or_edit_menu(u, c, fetching=False)
+
+# ====== 通知ジョブ ======
 async def poll_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    global LAST_STATUS_STR, LAST_AT
-    st, at = await fetch_status()
-    log.info("poll: fetched=%s", st)
-    if not st:
+    # 購読者にだけ監視をかける
+    if not SUBSCRIBERS:
         return
-    if st != LAST_STATUS_STR:
-        LAST_STATUS_STR, LAST_AT = st, at
-        text = f"【更新】王子店ダーツ: {st}（{fmt_jst(at)}）\n{URL}"
-        for chat_id in list(SUBSCRIBERS):
+    status, _ = await fetch_status()
+    if not status:
+        log.info("poll: fetched=None")
+        return
+
+    # 変化があったチャットにだけ新規メッセージで通知
+    for chat_id in list(SUBSCRIBERS):
+        last = get_last(chat_id)
+        if status != last.status:
+            set_last(chat_id, status, now_jp_str())
+            text = f"【更新】王子店ダーツ: {status}（{now_jp_str()}）\n{URL}"
             try:
-                await ctx.bot.send_message(chat_id, text)
+                await ctx.bot.send_message(chat_id, text, disable_web_page_preview=False)
             except Exception as e:
                 log.warning("send failed %s: %s", chat_id, e)
-
-# ========= ハンドラ =========
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_menu(update.effective_chat.id, ctx)
-
-async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(f"pong（{fmt_jst(datetime.now(TZ))}）")
-
-async def on_text_start_like(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_menu(update.effective_chat.id, ctx)
-
-async def on_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """ON→取得して反映（同じメッセ編集）。OFF→取得せずキャッシュで即OFF（同じメッセ編集）。"""
-    q = update.callback_query
-    await q.answer()
-    chat_id = q.message.chat_id
-    is_on = chat_id in SUBSCRIBERS
-
-    if is_on:
-        # -> OFF（新規取得しない／新規メッセージは送らない）
-        SUBSCRIBERS.discard(chat_id)
-        _save_subs(SUBSCRIBERS)
-        await edit_menu(q.message, False)
-    else:
-        # -> ON（スピナー→取得→同じメッセ編集）
-        stop = asyncio.Event()
-        spinner_task = asyncio.create_task(animate_spinner(q.message, stop))
-        st, at = await fetch_status()
-        stop.set()
-        try:
-            await asyncio.wait_for(spinner_task, timeout=1)
-        except Exception:
+        else:
+            # 変化なし：何もしない（メニューは「今すぐ取得」で更新可能）
             pass
 
-        if st:
-            global LAST_STATUS_STR, LAST_AT
-            LAST_STATUS_STR, LAST_AT = st, at
-        SUBSCRIBERS.add(chat_id)
-        _save_subs(SUBSCRIBERS)
-        await edit_menu(q.message, True)
-
-async def on_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """今すぐ取得：同一メッセージをスピナー表示→完了後メニューに再編集"""
-    q = update.callback_query
-    await q.answer("更新中…")
-    stop = asyncio.Event()
-    spinner_task = asyncio.create_task(animate_spinner(q.message, stop))
-
-    st, at = await fetch_status()
-    stop.set()
-    try:
-        await asyncio.wait_for(spinner_task, timeout=1)
-    except Exception:
-        pass
-
-    if st:
-        global LAST_STATUS_STR, LAST_AT
-        LAST_STATUS_STR, LAST_AT = st, at
-
-    is_on = q.message.chat_id in SUBSCRIBERS
-    await edit_menu(q.message, is_on)
-
-async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    st, at = await fetch_status()
-    if st:
-        global LAST_STATUS_STR, LAST_AT
-        LAST_STATUS_STR, LAST_AT = st, at
-        await update.message.reply_text(status_line())
-    else:
-        await update.message.reply_text("取得に失敗しました。")
-
-# ========= 起動 =========
+# ====== アプリ ======
 def build_app() -> Application:
-    if not TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("ping", cmd_ping))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^(開始|スタート)$"), on_text_start_like))
-    app.add_handler(CallbackQueryHandler(on_toggle, pattern="^toggle$"))
-    app.add_handler(CallbackQueryHandler(on_refresh, pattern="^refresh$"))
+    app.add_handler(MessageHandler(filters.Regex(r"^(スタート|開始)$"), msg_start_ja))
 
-    app.job_queue.run_repeating(poll_job, interval=CHECK_INTERVAL_SEC, first=5, name="poll_job")
+    app.add_handler(CallbackQueryHandler(lambda u, c: on_toggle(u, c, True), pattern="^toggle_on$"))
+    app.add_handler(CallbackQueryHandler(lambda u, c: on_toggle(u, c, False), pattern="^toggle_off$"))
+    app.add_handler(CallbackQueryHandler(on_get_now, pattern="^get_now$"))
+
+    app.job_queue.run_repeating(poll_job, interval=CHECK_INTERVAL_SEC, first=10)
     return app
 
 def main() -> None:
     app = build_app()
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
